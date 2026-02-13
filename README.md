@@ -28,7 +28,7 @@ echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc && source ~/.bashrc
 git clone https://github.com/patrick-projects/BenevolentGinx2.git
 cd BenevolentGinx2
 make build
-./build/evilginx
+./build/evilginx -p ./phishlets
 ```
 
 Type `help` at the prompt for commands.
