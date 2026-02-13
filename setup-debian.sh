@@ -195,10 +195,29 @@ elif command -v iptables &>/dev/null; then
 fi
 
 # ─── Step 8: Stop conflicting services ──────────────────────────────
-step "Checking for port conflicts"
-for svc in apache2 nginx systemd-resolved; do
+step "Resolving port conflicts"
+
+# systemd-resolved holds port 53 — evilginx needs it for DNS
+if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    info "Stopping and disabling systemd-resolved (conflicts with DNS on port 53)..."
+    systemctl stop systemd-resolved
+    systemctl disable systemd-resolved
+
+    # Point /etc/resolv.conf to a real upstream DNS so the system still resolves
+    if [ -L /etc/resolv.conf ]; then
+        rm -f /etc/resolv.conf
+    fi
+    if ! grep -q 'nameserver' /etc/resolv.conf 2>/dev/null; then
+        echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
+        info "Set /etc/resolv.conf to use 1.1.1.1 / 8.8.8.8"
+    fi
+    info "systemd-resolved stopped and disabled"
+fi
+
+# Warn about web servers that hold port 80/443
+for svc in apache2 nginx; do
     if systemctl is-active --quiet "$svc" 2>/dev/null; then
-        warn "$svc is running and may conflict. To stop it:"
+        warn "$svc is running and may conflict with ports 80/443. To stop it:"
         echo -e "    ${CYAN}sudo systemctl stop $svc && sudo systemctl disable $svc${NC}"
     fi
 done
