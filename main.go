@@ -3,11 +3,16 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io/ioutil"
 	_log "log"
+	"net"
+	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"strings"
+	"time"
 
 	"github.com/caddyserver/certmagic"
 	"github.com/kgretzky/evilginx2/core"
@@ -24,6 +29,31 @@ var debug_log = flag.Bool("debug", false, "Enable debug output")
 var developer_mode = flag.Bool("developer", false, "Enable developer mode (generates self-signed certificates for all hostnames)")
 var cfg_dir = flag.String("c", "", "Configuration directory path")
 var version_flag = flag.Bool("v", false, "Show version")
+
+func detectExternalIP() string {
+	services := []string{
+		"https://api.ipify.org",
+		"https://ifconfig.me/ip",
+		"https://icanhazip.com",
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, svc := range services {
+		resp, err := client.Get(svc)
+		if err != nil {
+			continue
+		}
+		body, err := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		ip := strings.TrimSpace(string(body))
+		if net.ParseIP(ip) != nil {
+			return ip
+		}
+	}
+	return ""
+}
 
 func joinPath(base_path string, rel_path string) string {
 	var ret string
@@ -127,6 +157,17 @@ func main() {
 		return
 	}
 	cfg.SetRedirectorsDir(*redirectors_dir)
+
+	// Auto-detect external IP if not already configured
+	if cfg.GetServerExternalIP() == "" {
+		log.Info("external IP not set — auto-detecting...")
+		if extIP := detectExternalIP(); extIP != "" {
+			cfg.SetServerExternalIP(extIP)
+			log.Success("external IP auto-detected: %s", extIP)
+		} else {
+			log.Warning("could not auto-detect external IP — set manually: config ipv4 external <ip>")
+		}
+	}
 
 	db, err := database.NewDatabase(filepath.Join(*cfg_dir, "data.db"))
 	if err != nil {
