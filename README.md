@@ -7,7 +7,7 @@
 
 # BenevolentGinx2 (Enhanced Community Edition)
 
-This repository is a community-enhanced fork of [kgretzky/evilginx2](https://github.com/kgretzky/evilginx2). It adds Pro-style features (REST API, Botguard, notifications, obfuscation, website spoofing, AES-256 encryption, multi-domain support, named proxy profiles) while remaining fully open source. **Original work by Kuba Gretzky; this project is released under the same [BSD-3-Clause license](LICENSE).**
+This repository is a community-enhanced fork of [kgretzky/evilginx2](https://github.com/kgretzky/evilginx2). It adds QoL features (REST API, Botguard, notifications, obfuscation, website spoofing, AES-256 encryption, multi-domain support, named proxy profiles) while remaining fully open source. **Original work by Kuba Gretzky; this project is released under the same [BSD-3-Clause license](LICENSE).**
 
 ---
 
@@ -34,7 +34,7 @@ This is it! After over two years of development, countless delays, and hundreds 
   <a href="https://evilginx.com"><img alt="Evilginx Mastery" src="https://breakdev.org/content/images/size/w2000/2025/03/evilginx_pro_release_cover.png" height="320" /></a>
 </p>
 
-Evilginx Pro is the fruit of a passion I've had for a long time in developing offensive security tools for cybersecurity enthusiasts. The journey has just begun, and now that the product is officially released, I can focus on making it even better by implementing all the ideas I've planned for it.
+
 
 ### Key features:
 
@@ -49,57 +49,7 @@ Evilginx Pro is the fruit of a passion I've had for a long time in developing of
 - **Automated** server deployment
 - **SQLite** database support
 
-Find out more on the [official release blog post](https://breakdev.org/evilginx-pro-release/).
-
-## Evilginx Mastery Training Course
-
-If you want everything about reverse proxy phishing with **Evilginx** - check out my [Evilginx Mastery](https://academy.breakdev.org/evilginx-mastery) course!
-
-<p align="center">
-  <a href="https://academy.breakdev.org/evilginx-mastery"><img alt="Evilginx Mastery" src="https://raw.githubusercontent.com/kgretzky/evilginx2/master/media/img/evilginx_mastery.jpg" height="320" /></a>
-</p>
-
-Learn everything about the latest methods of phishing, using reverse proxying to bypass Multi-Factor Authentication. Learn to think like an attacker, during your red team engagements, and become the master of phishing with Evilginx.
-
-Grab it here:
-https://academy.breakdev.org/evilginx-mastery
-
-## Official Gophish integration
-
-If you'd like to use Gophish to send out phishing links compatible with Evilginx, please use the official Gophish integration with Evilginx 3.3.
-You can find the custom version here in the forked repository: [Gophish with Evilginx integration](https://github.com/kgretzky/gophish/)
-
-If you want to learn more about how to set it up, please follow the instructions in [this blog post](https://breakdev.org/evilginx-3-3-go-phish/)
-
-## Write-ups
-
-If you want to learn more about reverse proxy phishing, I've published extensive blog posts about **Evilginx** here:
-
-[Evilginx 2.0 - Release](https://breakdev.org/evilginx-2-next-generation-of-phishing-2fa-tokens)
-
-[Evilginx 2.1 - First Update](https://breakdev.org/evilginx-2-1-the-first-post-release-update/)
-
-[Evilginx 2.2 - Jolly Winter Update](https://breakdev.org/evilginx-2-2-jolly-winter-update/)
-
-[Evilginx 2.3 - Phisherman's Dream](https://breakdev.org/evilginx-2-3-phishermans-dream/)
-
-[Evilginx 2.4 - Gone Phishing](https://breakdev.org/evilginx-2-4-gone-phishing/)
-
-[Evilginx 3.0](https://breakdev.org/evilginx-3-0-evilginx-mastery/)
-
-[Evilginx 3.2](https://breakdev.org/evilginx-3-2/)
-
-[Evilginx 3.3](https://breakdev.org/evilginx-3-3-go-phish/)
-
-## Help
-
-In case you want to learn how to install and use **Evilginx**, please refer to online documentation available at:
-
-https://help.evilginx.com
-
-## Support
-
-I DO NOT offer support for providing or creating phishlets. I will also NOT help you with creation of your own phishlets. Please look for ready-to-use phishlets, provided by other people.
+by other people.
 
 ## License
 
