@@ -10,16 +10,11 @@ Install dependencies and Go (1.16+ required):
 
 ```bash
 sudo apt update
-sudo apt install -y git build-essential
 
 # Go: use system package on Debian 12, or install from go.dev on older releases
 sudo apt install -y golang-go
 go version   # must be 1.16 or newer
 
-# If golang-go is too old, install from https://go.dev/dl/ instead, e.g.:
-# wget https://go.dev/dl/go1.21.5.linux-amd64.tar.gz
-# sudo tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz
-# echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc && source ~/.bashrc
 ```
 
 ---
