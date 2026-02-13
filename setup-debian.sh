@@ -181,17 +181,36 @@ UNIT
 systemctl daemon-reload
 info "Systemd service created: evilginx.service"
 
-# ─── Step 7: Firewall hints ─────────────────────────────────────────
-step "Firewall configuration"
-if command -v ufw &>/dev/null; then
-    warn "UFW detected. You may need to open these ports:"
-    echo -e "    ${CYAN}sudo ufw allow 443/tcp${NC}    # HTTPS proxy"
-    echo -e "    ${CYAN}sudo ufw allow 80/tcp${NC}     # HTTP redirect"
-    echo -e "    ${CYAN}sudo ufw allow 53/udp${NC}     # DNS"
-    echo -e "    ${CYAN}sudo ufw allow 7777/tcp${NC}   # EvilPuppet web UI"
+# ─── Step 7: Firewall configuration ────────────────────────────────
+step "Configuring firewall"
+if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
+    info "UFW is active — opening required ports..."
+    ufw allow 443/tcp  >/dev/null 2>&1 && info "  443/tcp (HTTPS) opened"
+    ufw allow 80/tcp   >/dev/null 2>&1 && info "   80/tcp (HTTP) opened"
+    ufw allow 53/udp   >/dev/null 2>&1 && info "   53/udp (DNS) opened"
+    ufw allow 7777/tcp >/dev/null 2>&1 && info " 7777/tcp (EvilPuppet) opened"
 elif command -v iptables &>/dev/null; then
-    warn "Make sure these ports are open in iptables:"
-    echo -e "    443/tcp (HTTPS), 80/tcp (HTTP), 53/udp (DNS), 7777/tcp (EvilPuppet)"
+    info "Opening ports via iptables..."
+    for port_proto in "443:tcp" "80:tcp" "53:udp" "7777:tcp"; do
+        port="${port_proto%%:*}"
+        proto="${port_proto##*:}"
+        if ! iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+            iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT
+            info "  ${port}/${proto} opened"
+        else
+            info "  ${port}/${proto} already open"
+        fi
+    done
+    # Persist iptables rules if iptables-persistent is available
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save >/dev/null 2>&1
+        info "iptables rules saved"
+    else
+        warn "Install iptables-persistent to keep rules across reboots:"
+        echo -e "    ${CYAN}apt install -y iptables-persistent${NC}"
+    fi
+else
+    info "No firewall detected — ports should be open by default"
 fi
 
 # ─── Step 8: Stop conflicting services ──────────────────────────────
