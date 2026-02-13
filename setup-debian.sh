@@ -129,6 +129,7 @@ info "Running go mod vendor..."
 go mod vendor 2>/dev/null || go mod tidy && go mod vendor
 
 info "Compiling..."
+mkdir -p ./build
 go build -o ./build/evilginx -mod=vendor main.go
 info "Binary built: $(ls -lh ./build/evilginx | awk '{print $5}') → ./build/evilginx"
 

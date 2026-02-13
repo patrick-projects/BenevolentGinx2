@@ -2,5 +2,5 @@ release/
 build/
 private/
 /evilginx
-/phishlets
+/phishlets/*
 !/phishlets/example.yaml
