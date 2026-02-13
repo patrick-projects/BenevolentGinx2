@@ -2063,6 +2063,11 @@ func (t *Terminal) checkStatus() {
 	if !hasPhishlets {
 		log.Warning("no phishlets found in phishlets directory")
 		log.Info("%s  add .yaml phishlet files to the phishlets/ directory and restart", dgray.Sprint("step 3 →"))
+		log.Info("")
+		log.Info("%s  community phishlets: %s", dgray.Sprint("       "), cyan.Sprint("https://github.com/An0nUD4Y/Evilginx2-Phishlets"))
+		log.Info("%s  copy to server:      %s", dgray.Sprint("       "), cyan.Sprint("scp phishlet.yaml root@<server>:/opt/evilginx/phishlets/"))
+		log.Info("")
+		log.Info("%s  then restart evilginx to load the new phishlet", dgray.Sprint("       "))
 		return
 	}
 
