@@ -213,16 +213,8 @@ func (a *Analyzer) StartAnalysis(targetURL string) (*AnalyzerSession, error) {
 }
 
 func (a *Analyzer) runRecording(sess *AnalyzerSession) {
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("disable-web-security", false),
-		chromedp.Flag("disable-features", "VizDisplayCompositor"),
-		chromedp.WindowSize(sess.viewportW, sess.viewportH),
-		chromedp.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
-	)
+	analyzerUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	opts := StealthChromeOpts(analyzerUA, sess.viewportW, sess.viewportH)
 
 	if a.pm.chromePath != "" {
 		opts = append(opts, chromedp.ExecPath(a.pm.chromePath))
@@ -235,6 +227,9 @@ func (a *Analyzer) runRecording(sess *AnalyzerSession) {
 	ctx, cancel := chromedp.NewContext(allocCtx)
 	sess.ctx = ctx
 	sess.cancel = cancel
+
+	// Inject stealth scripts before any page loads
+	InjectStealthScripts(ctx, analyzerUA)
 
 	// Enable network tracking and attach event listeners
 	if err := chromedp.Run(ctx, network.Enable()); err != nil {

