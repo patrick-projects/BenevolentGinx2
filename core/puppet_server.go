@@ -174,7 +174,8 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 				if !ok {
 					return
 				}
-				// Send screenshot as binary message (raw JPEG bytes)
+				// Set write deadline so a stalled client doesn't freeze the server
+				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
 					return
 				}
@@ -190,6 +191,9 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 		}
 	}()
 
+	// Set read deadline — refreshed on every message (keepalive pings extend it)
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+
 	// Read input events from the client
 	for {
 		_, message, err := conn.ReadMessage()
@@ -197,8 +201,16 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 			break
 		}
 
+		// Refresh deadline on every message received
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+
 		var pi PuppetInput
 		if err := json.Unmarshal(message, &pi); err != nil {
+			continue
+		}
+
+		// Ignore keepalive pings
+		if pi.Type == "ping" {
 			continue
 		}
 
@@ -476,16 +488,25 @@ body {
         ws.onopen = function() {
             setStatus('connected', 'Connected');
             reconnectDelay = 1000;
+            // Send keepalive pings to prevent idle timeout
+            if (window._pingInterval) clearInterval(window._pingInterval);
+            window._pingInterval = setInterval(function() {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({type: 'ping'}));
+                }
+            }, 15000);
         };
 
         ws.onclose = function() {
             setStatus('disconnected', 'Disconnected - reconnecting...');
+            if (window._pingInterval) clearInterval(window._pingInterval);
             setTimeout(connect, reconnectDelay);
             reconnectDelay = Math.min(reconnectDelay * 1.5, 10000);
         };
 
         ws.onerror = function() {
             setStatus('disconnected', 'Connection error');
+            if (window._pingInterval) clearInterval(window._pingInterval);
         };
 
         ws.onmessage = function(event) {

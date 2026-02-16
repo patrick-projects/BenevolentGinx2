@@ -511,7 +511,7 @@ func (a *Analyzer) captureFinalCookies(sess *AnalyzerSession) {
 }
 
 func (a *Analyzer) screenshotLoop(sess *AnalyzerSession) {
-	ticker := time.NewTicker(150 * time.Millisecond)
+	ticker := time.NewTicker(500 * time.Millisecond) // ~2fps — lighter on the server during recording
 	defer ticker.Stop()
 
 	for {
@@ -527,15 +527,18 @@ func (a *Analyzer) screenshotLoop(sess *AnalyzerSession) {
 				continue
 			}
 
+			// Use a timeout context so a slow screenshot doesn't block everything
+			screenshotCtx, screenshotCancel := context.WithTimeout(sess.ctx, 3*time.Second)
 			var buf []byte
-			err := chromedp.Run(sess.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+			err := chromedp.Run(screenshotCtx, chromedp.ActionFunc(func(ctx context.Context) error {
 				var err error
 				buf, err = page.CaptureScreenshot().
 					WithFormat(page.CaptureScreenshotFormatJpeg).
-					WithQuality(55).
+					WithQuality(40).
 					Do(ctx)
 				return err
 			}))
+			screenshotCancel()
 			if err != nil {
 				continue
 			}
@@ -544,6 +547,11 @@ func (a *Analyzer) screenshotLoop(sess *AnalyzerSession) {
 			sess.lastScreen = buf
 			sess.mu.Unlock()
 
+			// Drain any stale frame before sending new one
+			select {
+			case <-sess.screenCh:
+			default:
+			}
 			select {
 			case sess.screenCh <- buf:
 			default:

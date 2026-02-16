@@ -297,7 +297,7 @@ func (pm *PuppetManager) runPuppet(puppet *PuppetInstance, dbSession *database.S
 }
 
 func (pm *PuppetManager) screenshotLoop(puppet *PuppetInstance) {
-	ticker := time.NewTicker(150 * time.Millisecond) // ~6-7 fps
+	ticker := time.NewTicker(300 * time.Millisecond) // ~3 fps — balanced for low-resource servers
 	defer ticker.Stop()
 
 	for {
@@ -313,15 +313,18 @@ func (pm *PuppetManager) screenshotLoop(puppet *PuppetInstance) {
 				continue
 			}
 
+			// Timeout so a slow capture doesn't block input handling
+			screenshotCtx, screenshotCancel := context.WithTimeout(puppet.ctx, 3*time.Second)
 			var buf []byte
-			err := chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+			err := chromedp.Run(screenshotCtx, chromedp.ActionFunc(func(ctx context.Context) error {
 				var err error
 				buf, err = page.CaptureScreenshot().
 					WithFormat(page.CaptureScreenshotFormatJpeg).
-					WithQuality(55).
+					WithQuality(45).
 					Do(ctx)
 				return err
 			}))
+			screenshotCancel()
 			if err != nil {
 				continue
 			}
@@ -330,11 +333,14 @@ func (pm *PuppetManager) screenshotLoop(puppet *PuppetInstance) {
 			puppet.lastScreen = buf
 			puppet.mu.Unlock()
 
-			// Non-blocking send to screenshot channel
+			// Drain stale frame, then send new one
+			select {
+			case <-puppet.screenCh:
+			default:
+			}
 			select {
 			case puppet.screenCh <- buf:
 			default:
-				// Drop frame if channel is full (client not consuming fast enough)
 			}
 		}
 	}
