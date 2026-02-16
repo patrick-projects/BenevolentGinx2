@@ -403,6 +403,14 @@ func (pm *PuppetManager) handleMouseClick(puppet *PuppetInstance, pi PuppetInput
 
 	return chromedp.Run(puppet.ctx,
 		chromedp.ActionFunc(func(ctx context.Context) error {
+			// Move to the target position first to trigger hover/focus states
+			if err := input.DispatchMouseEvent(input.MouseMoved, pi.X, pi.Y).
+				Do(ctx); err != nil {
+				return err
+			}
+			// Small delay to let hover handlers fire
+			time.Sleep(30 * time.Millisecond)
+
 			if err := input.DispatchMouseEvent(input.MousePressed, pi.X, pi.Y).
 				WithButton(btn).
 				WithClickCount(1).
@@ -410,6 +418,9 @@ func (pm *PuppetManager) handleMouseClick(puppet *PuppetInstance, pi PuppetInput
 				Do(ctx); err != nil {
 				return err
 			}
+			// Small delay between press and release to simulate real click timing
+			time.Sleep(40 * time.Millisecond)
+
 			return input.DispatchMouseEvent(input.MouseReleased, pi.X, pi.Y).
 				WithButton(btn).
 				WithClickCount(1).

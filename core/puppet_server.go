@@ -587,7 +587,10 @@ body {
     }
 
     // Mouse events on the viewport
+    // Only use 'click' for left button to avoid double-firing (mousedown+mouseup+click = 2 clicks).
+    // Right/middle clicks still use mousedown/mouseup since 'click' doesn't fire for them.
     viewport.addEventListener('mousedown', function(e) {
+        if (e.button === 0) { e.preventDefault(); return; } // Left click handled by 'click' event
         const c = getScaledCoords(e);
         if (!c) return;
         sendInput({type: 'mousedown', x: c.x, y: c.y, button: buttonName(e.button), modifiers: getModifiers(e)});
@@ -595,6 +598,7 @@ body {
     });
 
     viewport.addEventListener('mouseup', function(e) {
+        if (e.button === 0) { e.preventDefault(); return; }
         const c = getScaledCoords(e);
         if (!c) return;
         sendInput({type: 'mouseup', x: c.x, y: c.y, button: buttonName(e.button), modifiers: getModifiers(e)});
@@ -604,16 +608,22 @@ body {
     viewport.addEventListener('click', function(e) {
         const c = getScaledCoords(e);
         if (!c) return;
-        sendInput({type: 'click', x: c.x, y: c.y, button: buttonName(e.button), modifiers: getModifiers(e)});
+        // Send a mousemove first to trigger hover states (required by many modern login pages)
+        sendInput({type: 'mousemove', x: c.x, y: c.y});
+        // Small delay then click — lets the hover state register before the click
+        setTimeout(function() {
+            sendInput({type: 'click', x: c.x, y: c.y, button: buttonName(e.button), modifiers: getModifiers(e)});
+        }, 50);
         e.preventDefault();
     });
 
     viewport.addEventListener('dblclick', function(e) {
         const c = getScaledCoords(e);
         if (!c) return;
-        // Send double click as two rapid clicks
         sendInput({type: 'click', x: c.x, y: c.y, button: 'left', modifiers: getModifiers(e)});
-        sendInput({type: 'click', x: c.x, y: c.y, button: 'left', modifiers: getModifiers(e)});
+        setTimeout(function() {
+            sendInput({type: 'click', x: c.x, y: c.y, button: 'left', modifiers: getModifiers(e)});
+        }, 80);
         e.preventDefault();
     });
 
