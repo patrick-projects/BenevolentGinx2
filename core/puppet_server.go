@@ -201,8 +201,13 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 		conn.WriteMessage(websocket.TextMessage, updateJSON)
 	}
 
-	// Get the content channel for live streaming
+	// Get channels for live streaming
 	contentCh, err := ps.pm.GetContentChan(puppetId)
+	if err != nil {
+		log.Error("puppet ws: %v", err)
+		return
+	}
+	inputCh, err := ps.pm.GetInputChan(puppetId)
 	if err != nil {
 		log.Error("puppet ws: %v", err)
 		return
@@ -210,7 +215,13 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 
 	stopCh := make(chan struct{})
 
-	// DOM streaming goroutine
+	writeMsg := func(update *DOMUpdate) bool {
+		updateJSON, _ := json.Marshal(update)
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		return conn.WriteMessage(websocket.TextMessage, updateJSON) == nil
+	}
+
+	// DOM + input streaming goroutine — reads from both channels
 	go func() {
 		for {
 			select {
@@ -220,9 +231,14 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 				if !ok {
 					return
 				}
-				updateJSON, _ := json.Marshal(update)
-				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				if err := conn.WriteMessage(websocket.TextMessage, updateJSON); err != nil {
+				if !writeMsg(update) {
+					return
+				}
+			case update, ok := <-inputCh:
+				if !ok {
+					return
+				}
+				if !writeMsg(update) {
 					return
 				}
 			}

@@ -82,6 +82,7 @@ type AnalyzerSession struct {
 
 	// DOM streaming support (reuses puppet infrastructure)
 	contentCh     chan *DOMUpdate
+	inputCh       chan *DOMUpdate
 	stopCh        chan struct{}
 	viewportW     int
 	viewportH     int
@@ -196,6 +197,7 @@ func (a *Analyzer) StartAnalysis(targetURL string) (*AnalyzerSession, error) {
 		creds:     []DetectedCredential{},
 		domains:   make(map[string]*DomainStats),
 		contentCh:     make(chan *DOMUpdate, 5),
+		inputCh:       make(chan *DOMUpdate, 10),
 		stopCh:        make(chan struct{}),
 		viewportW:     1920,
 		viewportH:     1080,
@@ -642,6 +644,7 @@ func (a *Analyzer) registerAsPuppet(sess *AnalyzerSession) *PuppetInstance {
 		allocCtx:      sess.allocCtx,
 		allocCancel:   sess.allocCancel,
 		contentCh:     sess.contentCh,
+		inputCh:       sess.inputCh,
 		stopCh:        sess.stopCh,
 		viewportW:     sess.viewportW,
 		viewportH:     sess.viewportH,

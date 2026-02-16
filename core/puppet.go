@@ -75,6 +75,7 @@ type PuppetInstance struct {
 
 	mu            sync.Mutex
 	contentCh     chan *DOMUpdate   // DOM updates for WebSocket streaming
+	inputCh       chan *DOMUpdate   // Input change updates (separate to avoid drain)
 	stopCh        chan struct{}
 	resourceCache *ResourceCache
 	lastUpdate    *DOMUpdate       // most recent full DOM state for new clients
@@ -195,6 +196,7 @@ func (pm *PuppetManager) LaunchPuppet(sessionId int, targetURL string) (*PuppetI
 		Status:        PUPPET_STARTING,
 		CreateTime:    time.Now(),
 		contentCh:     make(chan *DOMUpdate, 5),
+		inputCh:       make(chan *DOMUpdate, 10),
 		stopCh:        make(chan struct{}),
 		resourceCache: NewResourceCache(id),
 		viewportW:     1920,
@@ -360,7 +362,7 @@ func SetupInputChangeListener(puppet *PuppetInstance) {
 					SelectionEnd:   inputData.SelectionEnd,
 				}
 				select {
-				case puppet.contentCh <- update:
+				case puppet.inputCh <- update:
 				default:
 				}
 			}
@@ -525,79 +527,50 @@ func (pm *PuppetManager) HandleInput(puppetId int, pi PuppetInput) error {
 }
 
 // handleCSSClick clicks an element in the puppet browser identified by its CSS selector path.
-// It scrolls the element into view, computes its center coordinates, and dispatches real
-// mousePressed/mouseReleased events — matching Puppeteer's page.click() behavior so that
-// framework event handlers (React, Angular, etc.) see a genuine mouse event sequence.
+// Uses chromedp.Click which scrolls into view, computes precise coordinates via CDP's
+// dom.GetContentQuads, and dispatches the full mouse event sequence (mouseMoved, mousePressed,
+// mouseReleased). Falls back to JavaScript el.click() if the CDP approach fails.
 func (pm *PuppetManager) handleCSSClick(puppet *PuppetInstance, pi PuppetInput) error {
 	if pi.CSSPath == "" {
 		return nil
 	}
-	cssPathJSON, _ := json.Marshal(pi.CSSPath)
 
-	// Step 1: Find element, scroll into view, get center coordinates and tag info
-	var resultJSON string
-	err := chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
-		(function(path) {
-			var el = document.querySelector(path);
-			if (!el) return JSON.stringify({found: false});
-			el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
-			var rect = el.getBoundingClientRect();
-			return JSON.stringify({
-				found: true,
-				x: rect.left + rect.width / 2,
-				y: rect.top + rect.height / 2,
-				tag: el.tagName
-			});
-		})(%s)
-	`, string(cssPathJSON)), &resultJSON))
+	// Primary: use chromedp.Click — handles scroll, visibility wait, full mouse sequence
+	clickCtx, clickCancel := context.WithTimeout(puppet.ctx, 3*time.Second)
+	defer clickCancel()
+	err := chromedp.Run(clickCtx, chromedp.Click(pi.CSSPath, chromedp.ByQuery))
 	if err != nil {
-		return err
-	}
-
-	var pos struct {
-		Found bool    `json:"found"`
-		X     float64 `json:"x"`
-		Y     float64 `json:"y"`
-		Tag   string  `json:"tag"`
-	}
-	if err := json.Unmarshal([]byte(resultJSON), &pos); err != nil || !pos.Found {
-		return fmt.Errorf("element not found: %s", pi.CSSPath)
-	}
-
-	// Step 2: Dispatch real mouse events at the element's center (like Puppeteer)
-	err = chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		if err := input.DispatchMouseEvent(input.MousePressed, pos.X, pos.Y).
-			WithButton(input.Left).
-			WithClickCount(1).
-			Do(ctx); err != nil {
-			return err
-		}
-		return input.DispatchMouseEvent(input.MouseReleased, pos.X, pos.Y).
-			WithButton(input.Left).
-			WithClickCount(1).
-			Do(ctx)
-	}))
-	if err != nil {
-		return err
-	}
-
-	// Step 3: For input/textarea elements, ensure focus and cursor at end
-	if pos.Tag == "INPUT" || pos.Tag == "TEXTAREA" {
+		// Fallback: JavaScript click (handles edge cases where CDP click fails)
+		cssPathJSON, _ := json.Marshal(pi.CSSPath)
 		var ignored interface{}
-		chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
+		err = chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
 			(function(path) {
 				var el = document.querySelector(path);
-				if (el) {
-					el.focus();
-					if (el.value !== undefined) {
-						el.selectionStart = el.selectionEnd = el.value.length;
-					}
-				}
+				if (!el) return false;
+				el.scrollIntoView({block: 'center', behavior: 'instant'});
+				el.click();
+				if (el.focus) el.focus();
+				return true;
 			})(%s)
 		`, string(cssPathJSON)), &ignored))
 	}
 
-	return nil
+	// For input/textarea: ensure focus and place cursor at end of value
+	cssPathJSON, _ := json.Marshal(pi.CSSPath)
+	var ignored interface{}
+	chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
+		(function(path) {
+			var el = document.querySelector(path);
+			if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
+				el.focus();
+				if (el.value !== undefined) {
+					el.selectionStart = el.selectionEnd = el.value.length;
+				}
+			}
+		})(%s)
+	`, string(cssPathJSON)), &ignored))
+
+	return err
 }
 
 // handleKeyPress handles a key press event (EvilPuppetJS-style: single press = down+char+up).
@@ -775,6 +748,18 @@ func (pm *PuppetManager) GetContentChan(puppetId int) (chan *DOMUpdate, error) {
 		return nil, fmt.Errorf("puppet %d not found", puppetId)
 	}
 	return puppet.contentCh, nil
+}
+
+// GetInputChan returns the input change channel for live input sync.
+func (pm *PuppetManager) GetInputChan(puppetId int) (chan *DOMUpdate, error) {
+	pm.mu.RLock()
+	puppet, ok := pm.instances[puppetId]
+	pm.mu.RUnlock()
+
+	if !ok {
+		return nil, fmt.Errorf("puppet %d not found", puppetId)
+	}
+	return puppet.inputCh, nil
 }
 
 // GetResourceCache returns the resource cache for a puppet.
