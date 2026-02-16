@@ -372,16 +372,21 @@ body {
     overflow: hidden;
     display: flex;
     justify-content: center;
-    align-items: center;
+    align-items: flex-start;
     background: #010409;
     position: relative;
+    line-height: 0;
+    font-size: 0;
 }
 #viewport {
-    cursor: default;
+    cursor: crosshair;
     max-width: 100%%;
     max-height: 100%%;
     display: block;
     image-rendering: -webkit-optimize-contrast;
+    margin: 0;
+    padding: 0;
+    vertical-align: top;
 }
 .statusbar {
     display: flex;
