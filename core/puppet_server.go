@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -139,6 +140,17 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 
 	log.Info("puppet [%d]: web control client connected from %s", puppetId, r.RemoteAddr)
 
+	// Write mutex — gorilla/websocket does NOT support concurrent writers.
+	// Both the screenshot goroutine and input handler write to the connection.
+	var wmu sync.Mutex
+
+	safeWrite := func(msgType int, data []byte) error {
+		wmu.Lock()
+		defer wmu.Unlock()
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		return conn.WriteMessage(msgType, data)
+	}
+
 	// Send initial status
 	statusMsg := map[string]interface{}{
 		"type":      "status",
@@ -150,7 +162,7 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 		"viewportH": puppet.viewportH,
 	}
 	statusJSON, _ := json.Marshal(statusMsg)
-	conn.WriteMessage(websocket.TextMessage, statusJSON)
+	safeWrite(websocket.TextMessage, statusJSON)
 
 	// Start a goroutine to stream screenshots
 	screenCh, err := ps.pm.GetScreenChan(puppetId)
@@ -174,18 +186,15 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 				if !ok {
 					return
 				}
-				// Set write deadline so a stalled client doesn't freeze the server
-				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+				if err := safeWrite(websocket.BinaryMessage, frame); err != nil {
 					return
 				}
 			case <-urlTicker.C:
-				// Periodically send the current URL
 				currentURL, err := ps.pm.GetCurrentURL(puppetId)
 				if err == nil && currentURL != "" {
 					urlMsg := map[string]string{"type": "url", "url": currentURL}
 					urlJSON, _ := json.Marshal(urlMsg)
-					conn.WriteMessage(websocket.TextMessage, urlJSON)
+					safeWrite(websocket.TextMessage, urlJSON)
 				}
 			}
 		}
@@ -196,6 +205,7 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 
 	// Throttle inspect requests to avoid overloading CDP (max ~10/sec)
 	var lastInspectTime time.Time
+	var inspectMu sync.Mutex // protects lastInspectTime
 
 	// Read input events from the client
 	for {
@@ -217,41 +227,45 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 			continue
 		}
 
-		// Handle element inspector requests
+		// Handle element inspector requests — run async so we don't block the read loop
 		if pi.Type == "inspect" {
+			inspectMu.Lock()
 			now := time.Now()
 			if now.Sub(lastInspectTime) < 100*time.Millisecond {
-				continue // throttle: skip if less than 100ms since last inspect
-			}
-			lastInspectTime = now
-
-			info, err := ps.pm.InspectElementAt(puppetId, pi.X, pi.Y)
-			if err != nil {
-				// Send empty highlight to clear any existing overlay
-				clearMsg := map[string]interface{}{"type": "highlight", "selector": "", "rect": [4]float64{0, 0, 0, 0}}
-				clearJSON, _ := json.Marshal(clearMsg)
-				conn.WriteMessage(websocket.TextMessage, clearJSON)
+				inspectMu.Unlock()
 				continue
 			}
+			lastInspectTime = now
+			inspectMu.Unlock()
 
-			highlightMsg := map[string]interface{}{
-				"type":      "highlight",
-				"selector":  info.Selector,
-				"tag":       info.Tag,
-				"inputType": info.InputType,
-				"rect":      info.Rect,
-				"text":      info.Text,
-				"focusable": info.Focusable,
-			}
-			highlightJSON, _ := json.Marshal(highlightMsg)
-			conn.WriteMessage(websocket.TextMessage, highlightJSON)
+			go func(ix, iy float64) {
+				info, err := ps.pm.InspectElementAt(puppetId, ix, iy)
+				if err != nil {
+					clearMsg := map[string]interface{}{"type": "highlight", "selector": "", "rect": [4]float64{0, 0, 0, 0}}
+					clearJSON, _ := json.Marshal(clearMsg)
+					safeWrite(websocket.TextMessage, clearJSON)
+					return
+				}
+
+				highlightMsg := map[string]interface{}{
+					"type":      "highlight",
+					"selector":  info.Selector,
+					"tag":       info.Tag,
+					"inputType": info.InputType,
+					"rect":      info.Rect,
+					"text":      info.Text,
+					"focusable": info.Focusable,
+				}
+				highlightJSON, _ := json.Marshal(highlightMsg)
+				safeWrite(websocket.TextMessage, highlightJSON)
+			}(pi.X, pi.Y)
 			continue
 		}
 
 		if err := ps.pm.HandleInput(puppetId, pi); err != nil {
 			errMsg := map[string]string{"type": "error", "message": err.Error()}
 			errJSON, _ := json.Marshal(errMsg)
-			conn.WriteMessage(websocket.TextMessage, errJSON)
+			safeWrite(websocket.TextMessage, errJSON)
 		}
 	}
 
