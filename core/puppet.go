@@ -200,6 +200,8 @@ func (pm *PuppetManager) runPuppet(puppet *PuppetInstance, dbSession *database.S
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.Flag("disable-web-security", false),
 		chromedp.Flag("disable-features", "VizDisplayCompositor"),
+		chromedp.Flag("force-device-scale-factor", "1"),
+		chromedp.Flag("hide-scrollbars", true),
 		chromedp.WindowSize(puppet.viewportW, puppet.viewportH),
 		chromedp.UserAgent(dbSession.UserAgent),
 	)
@@ -224,14 +226,6 @@ func (pm *PuppetManager) runPuppet(puppet *PuppetInstance, dbSession *database.S
 		puppet.mu.Unlock()
 		log.Error("puppet [%d]: %s", puppet.Id, puppet.Error)
 		return
-	}
-
-	// Explicitly lock the viewport dimensions via CDP so that screenshots
-	// are guaranteed to be exactly viewportW x viewportH pixels.
-	// WindowSize alone sets the outer window; this ensures the inner
-	// rendering viewport matches, eliminating coordinate drift.
-	if err := chromedp.Run(ctx, chromedp.EmulateViewport(int64(puppet.viewportW), int64(puppet.viewportH))); err != nil {
-		log.Warning("puppet [%d]: failed to lock viewport metrics: %v", puppet.Id, err)
 	}
 
 	// Inject all captured cookies from the session

@@ -218,6 +218,8 @@ func (a *Analyzer) runRecording(sess *AnalyzerSession) {
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.Flag("disable-web-security", false),
 		chromedp.Flag("disable-features", "VizDisplayCompositor"),
+		chromedp.Flag("force-device-scale-factor", "1"),
+		chromedp.Flag("hide-scrollbars", true),
 		chromedp.WindowSize(sess.viewportW, sess.viewportH),
 		chromedp.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
 	)
@@ -243,12 +245,6 @@ func (a *Analyzer) runRecording(sess *AnalyzerSession) {
 		return
 	}
 
-	// Explicitly lock the viewport dimensions via CDP so that screenshots
-	// are guaranteed to be exactly viewportW x viewportH pixels.
-	if err := chromedp.Run(ctx, chromedp.EmulateViewport(int64(sess.viewportW), int64(sess.viewportH))); err != nil {
-		log.Warning("analyzer [%d]: failed to lock viewport metrics: %v", sess.Id, err)
-	}
-
 	// Listen for network requests
 	chromedp.ListenTarget(ctx, func(ev interface{}) {
 		switch e := ev.(type) {
@@ -272,6 +268,22 @@ func (a *Analyzer) runRecording(sess *AnalyzerSession) {
 	}
 
 	time.Sleep(2 * time.Second)
+
+	// Inject JavaScript to reliably capture POST data from form submissions,
+	// fetch, and XHR. CDP network events often miss form POST bodies for
+	// navigation requests (the page unloads before the data can be read).
+	a.injectPostCapture(sess)
+
+	// Re-inject the capture script after each page navigation
+	chromedp.ListenTarget(ctx, func(ev interface{}) {
+		switch ev.(type) {
+		case *page.EventLoadEventFired:
+			go a.injectPostCapture(sess)
+		}
+	})
+
+	// Start a goroutine to periodically poll captured POST data from JS
+	go a.pollCapturedPosts(sess)
 
 	log.Success("analyzer [%d]: recording started — interact via the puppet control panel", sess.Id)
 
@@ -408,6 +420,125 @@ func (a *Analyzer) handleResponse(sess *AnalyzerSession, e *network.EventRespons
 			}
 		}
 	}
+}
+
+// JavaScript snippet injected into the page to reliably capture POST data.
+// CDP network events often fail to capture form POST bodies for navigation
+// requests because the page unloads before the data can be read. This script
+// intercepts form submissions, fetch(), and XMLHttpRequest.send() and stores
+// the data in sessionStorage (which survives navigation).
+const postCaptureJS = `(function(){
+	if(window.__postHooked) return;
+	window.__postHooked = true;
+	function save(entry) {
+		try {
+			var arr = JSON.parse(sessionStorage.getItem('__pc') || '[]');
+			arr.push(entry);
+			sessionStorage.setItem('__pc', JSON.stringify(arr));
+		} catch(x){}
+	}
+	document.addEventListener('submit', function(e) {
+		try {
+			var fd = new FormData(e.target);
+			var obj = {};
+			fd.forEach(function(v,k){ obj[k] = String(v); });
+			save({u: e.target.action || location.href, d: JSON.stringify(obj), t: 'form'});
+		} catch(x){}
+	}, true);
+	var _f = window.fetch;
+	window.fetch = function(u, o) {
+		try {
+			if(o && o.method && o.method.toUpperCase() === 'POST' && o.body) {
+				save({u: typeof u === 'string' ? u : (u.url||''), d: typeof o.body === 'string' ? o.body : '', t: 'fetch'});
+			}
+		} catch(x){}
+		return _f.apply(this, arguments);
+	};
+	var _s = XMLHttpRequest.prototype.send;
+	var _o = XMLHttpRequest.prototype.open;
+	XMLHttpRequest.prototype.open = function(m, u) {
+		this.__m = m; this.__u = u;
+		return _o.apply(this, arguments);
+	};
+	XMLHttpRequest.prototype.send = function(b) {
+		try {
+			if(this.__m && this.__m.toUpperCase() === 'POST' && b) {
+				save({u: this.__u || '', d: typeof b === 'string' ? b : '', t: 'xhr'});
+			}
+		} catch(x){}
+		return _s.apply(this, arguments);
+	};
+})()`
+
+// injectPostCapture injects the POST data capture script into the current page.
+func (a *Analyzer) injectPostCapture(sess *AnalyzerSession) {
+	sess.mu.Lock()
+	ctx := sess.ctx
+	sess.mu.Unlock()
+	if ctx == nil {
+		return
+	}
+	chromedp.Run(ctx, chromedp.Evaluate(postCaptureJS, nil))
+}
+
+// pollCapturedPosts periodically reads POST data captured by the injected JS
+// and runs it through credential detection.
+func (a *Analyzer) pollCapturedPosts(sess *AnalyzerSession) {
+	ticker := time.NewTicker(1500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sess.stopCh:
+			// Final read before exiting
+			a.readCapturedPosts(sess)
+			return
+		case <-sess.ctx.Done():
+			return
+		case <-ticker.C:
+			a.readCapturedPosts(sess)
+		}
+	}
+}
+
+// readCapturedPosts reads and processes any POST data stored by the JS capture script.
+func (a *Analyzer) readCapturedPosts(sess *AnalyzerSession) {
+	sess.mu.Lock()
+	ctx := sess.ctx
+	sess.mu.Unlock()
+	if ctx == nil {
+		return
+	}
+
+	var raw string
+	readJS := `(function(){
+		var r = sessionStorage.getItem('__pc') || '[]';
+		sessionStorage.removeItem('__pc');
+		return r;
+	})()`
+	err := chromedp.Run(ctx, chromedp.Evaluate(readJS, &raw))
+	if err != nil || raw == "" || raw == "[]" {
+		return
+	}
+
+	var posts []struct {
+		URL  string `json:"u"`
+		Data string `json:"d"`
+		Type string `json:"t"`
+	}
+	if json.Unmarshal([]byte(raw), &posts) != nil {
+		return
+	}
+
+	sess.mu.Lock()
+	for _, p := range posts {
+		parsedURL, _ := url.Parse(p.URL)
+		postPath := ""
+		if parsedURL != nil {
+			postPath = parsedURL.Path
+		}
+		a.detectCredentials(sess, p.Data, p.URL, postPath)
+	}
+	sess.mu.Unlock()
 }
 
 func (a *Analyzer) parseCookieHeader(sess *AnalyzerSession, cookieStr string, responseURL string) {

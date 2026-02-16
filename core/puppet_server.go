@@ -651,7 +651,8 @@ body {
         lastMoveTime = now;
         const c = getScaledCoords(e);
         if (!c) return;
-        coordsEl.textContent = c.x + ', ' + c.y;
+        var diag = viewport.getBoundingClientRect();
+        coordsEl.textContent = c.x + ', ' + c.y + '  [img:' + (viewport.naturalWidth||'?') + 'x' + (viewport.naturalHeight||'?') + ' css:' + Math.round(diag.width) + 'x' + Math.round(diag.height) + ']';
         sendInput({type: 'mousemove', x: c.x, y: c.y});
     });
 
