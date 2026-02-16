@@ -560,11 +560,38 @@ body {
     function getScaledCoords(e) {
         const rect = viewport.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) return null;
-        const scaleX = VIEWPORT_W / rect.width;
-        const scaleY = VIEWPORT_H / rect.height;
+
+        // The image maintains aspect ratio, so we need to calculate the
+        // actual rendered content area within the element's bounding box.
+        var imgW = viewport.naturalWidth || VIEWPORT_W;
+        var imgH = viewport.naturalHeight || VIEWPORT_H;
+        var imgAspect = imgW / imgH;
+        var boxAspect = rect.width / rect.height;
+
+        var renderW, renderH, offsetX, offsetY;
+        if (imgAspect > boxAspect) {
+            // Image is wider than box — letterboxed top/bottom
+            renderW = rect.width;
+            renderH = rect.width / imgAspect;
+            offsetX = 0;
+            offsetY = (rect.height - renderH) / 2;
+        } else {
+            // Image is taller than box — pillarboxed left/right
+            renderH = rect.height;
+            renderW = rect.height * imgAspect;
+            offsetX = (rect.width - renderW) / 2;
+            offsetY = 0;
+        }
+
+        var relX = e.clientX - rect.left - offsetX;
+        var relY = e.clientY - rect.top - offsetY;
+
+        // Clamp to the rendered image area
+        if (relX < 0 || relX > renderW || relY < 0 || relY > renderH) return null;
+
         return {
-            x: Math.round((e.clientX - rect.left) * scaleX),
-            y: Math.round((e.clientY - rect.top) * scaleY)
+            x: Math.round((relX / renderW) * VIEWPORT_W),
+            y: Math.round((relY / renderH) * VIEWPORT_H)
         };
     }
 
@@ -648,9 +675,22 @@ body {
         e.preventDefault();
     });
 
+    // Paste support — intercept Ctrl+V / Cmd+V and send clipboard text
+    document.addEventListener('paste', function(e) {
+        if (document.activeElement === urlBar) return;
+        var text = (e.clipboardData || window.clipboardData).getData('text');
+        if (text) {
+            sendInput({type: 'type', text: text});
+        }
+        e.preventDefault();
+    });
+
     // Keyboard events (only when url bar is not focused)
     document.addEventListener('keydown', function(e) {
         if (document.activeElement === urlBar) return;
+
+        // Let paste event handle Ctrl+V / Cmd+V
+        if ((e.ctrlKey || e.metaKey) && e.key === 'v') return;
 
         if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
             // Printable character
@@ -664,6 +704,7 @@ body {
 
     document.addEventListener('keyup', function(e) {
         if (document.activeElement === urlBar) return;
+        if ((e.ctrlKey || e.metaKey) && e.key === 'v') return;
         if (e.key.length > 1 || e.ctrlKey || e.metaKey || e.altKey) {
             sendInput({type: 'keyup', key: e.key, code: e.code, modifiers: getModifiers(e)});
         }

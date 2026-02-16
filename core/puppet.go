@@ -438,21 +438,32 @@ func (pm *PuppetManager) handleMouseClick(puppet *PuppetInstance, pi PuppetInput
 		(function() {
 			var el = document.elementFromPoint(%f, %f);
 			if (!el) return;
-			// Walk up to find the nearest input/textarea if we hit a wrapper
-			var input = el.closest('input, textarea, [contenteditable="true"]');
-			if (!input) {
-				// Check if there's an input inside the clicked element
-				input = el.querySelector('input, textarea, [contenteditable="true"]');
+			var target = null;
+			// Check if el itself is an input
+			if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable) {
+				target = el;
 			}
-			if (input) {
-				input.focus();
-				input.click();
-				// For some frameworks, dispatching events directly helps
-				input.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
-				input.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
-				input.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+			// Search inside the clicked element for an input
+			if (!target) {
+				target = el.querySelector('input, textarea, [contenteditable="true"]');
+			}
+			// Walk up the DOM — check parent and grandparent for inputs
+			if (!target) {
+				var parent = el.parentElement;
+				for (var i = 0; i < 5 && parent; i++) {
+					target = parent.querySelector('input, textarea, [contenteditable="true"]');
+					if (target) break;
+					parent = parent.parentElement;
+				}
+			}
+			if (target) {
+				target.focus();
+				target.click();
+				// Set cursor to end of any existing value
+				if (target.value !== undefined) {
+					target.selectionStart = target.selectionEnd = target.value.length;
+				}
 			} else {
-				// No input found — just click and focus whatever is there
 				el.click();
 				if (el.focus) el.focus();
 			}
