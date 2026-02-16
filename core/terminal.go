@@ -2227,6 +2227,15 @@ func (t *Terminal) tokensToJSON(tokens map[string]string) string {
 }
 
 func (t *Terminal) checkStatus() {
+	// Don't show setup guidance while the analyzer is actively recording
+	if t.analyzer != nil {
+		for _, s := range t.analyzer.GetActiveSessions() {
+			if s.Status == "recording" {
+				return
+			}
+		}
+	}
+
 	cyan := color.New(color.FgCyan)
 	dgray := color.New(color.FgWhite)
 	yellow := color.New(color.FgYellow)

