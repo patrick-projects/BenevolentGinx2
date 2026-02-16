@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto/fetch"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
@@ -236,7 +237,7 @@ func (a *Analyzer) runRecording(sess *AnalyzerSession) {
 	sess.ctx = ctx
 	sess.cancel = cancel
 
-	// Enable network tracking and attach event listeners
+	// Enable network tracking
 	if err := chromedp.Run(ctx, network.Enable()); err != nil {
 		sess.mu.Lock()
 		sess.Status = "error"
@@ -245,15 +246,40 @@ func (a *Analyzer) runRecording(sess *AnalyzerSession) {
 		return
 	}
 
-	// Listen for network requests
+	// Enable the Fetch domain to intercept POST requests.
+	// This PAUSES each matching request, letting us read the POST body
+	// before it's sent. This is the only reliable way to capture form POST
+	// data for navigation requests (form.submit() etc.).
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		return fetch.Enable().
+			WithPatterns([]*fetch.RequestPattern{
+				{ResourceType: network.ResourceTypeDocument, RequestStage: fetch.RequestStageRequest},
+				{ResourceType: network.ResourceTypeXHR, RequestStage: fetch.RequestStageRequest},
+				{ResourceType: network.ResourceTypeFetch, RequestStage: fetch.RequestStageRequest},
+			}).Do(ctx)
+	})); err != nil {
+		log.Warning("analyzer [%d]: could not enable Fetch interception: %v", sess.Id, err)
+	}
+
+	// Listen for all CDP events: Network (for domain/cookie tracking),
+	// Fetch (for reliable POST body capture), and Page events.
 	chromedp.ListenTarget(ctx, func(ev interface{}) {
 		switch e := ev.(type) {
+		// Network events — track domains, requests, cookies
 		case *network.EventRequestWillBeSent:
 			a.handleRequest(sess, e)
 		case *network.EventResponseReceived:
 			a.handleResponse(sess, e)
+
+		// Fetch domain — paused requests with guaranteed POST body access
+		case *fetch.EventRequestPaused:
+			go a.handleFetchPaused(sess, e)
+
+		// Page events
 		case *page.EventJavascriptDialogOpening:
 			go chromedp.Run(ctx, page.HandleJavaScriptDialog(true))
+		case *page.EventLoadEventFired:
+			go a.injectPostCapture(sess)
 		}
 	})
 
@@ -269,18 +295,8 @@ func (a *Analyzer) runRecording(sess *AnalyzerSession) {
 
 	time.Sleep(2 * time.Second)
 
-	// Inject JavaScript to reliably capture POST data from form submissions,
-	// fetch, and XHR. CDP network events often miss form POST bodies for
-	// navigation requests (the page unloads before the data can be read).
+	// Also inject JS capture as an additional layer
 	a.injectPostCapture(sess)
-
-	// Re-inject the capture script after each page navigation
-	chromedp.ListenTarget(ctx, func(ev interface{}) {
-		switch ev.(type) {
-		case *page.EventLoadEventFired:
-			go a.injectPostCapture(sess)
-		}
-	})
 
 	// Start a goroutine to periodically poll captured POST data from JS
 	go a.pollCapturedPosts(sess)
@@ -420,6 +436,81 @@ func (a *Analyzer) handleResponse(sess *AnalyzerSession, e *network.EventRespons
 			}
 		}
 	}
+}
+
+// handleFetchPaused processes a request paused by the Fetch domain.
+// The request is held in Chrome's memory until we call ContinueRequest,
+// so we have guaranteed access to the POST body — even for form submissions
+// that cause page navigation (the main failure mode of other approaches).
+func (a *Analyzer) handleFetchPaused(sess *AnalyzerSession, e *fetch.EventRequestPaused) {
+	sess.mu.Lock()
+	ctx := sess.ctx
+	sess.mu.Unlock()
+
+	// ALWAYS continue the request — if we don't, the page hangs forever
+	defer func() {
+		if ctx != nil {
+			contCtx, contCancel := context.WithTimeout(ctx, 3*time.Second)
+			defer contCancel()
+			fetch.ContinueRequest(e.RequestID).Do(contCtx)
+		}
+	}()
+
+	if e.Request.Method != "POST" || !e.Request.HasPostData {
+		return
+	}
+
+	// Extract POST body from the paused request
+	postData := ""
+
+	// Method 1: Read from PostDataEntries (base64-encoded)
+	for _, entry := range e.Request.PostDataEntries {
+		if entry.Bytes != "" {
+			decoded, err := base64.StdEncoding.DecodeString(entry.Bytes)
+			if err == nil {
+				postData += string(decoded)
+			} else {
+				postData += entry.Bytes
+			}
+		}
+	}
+
+	// Method 2: Use GetRequestPostData via the network request ID
+	if postData == "" && e.NetworkID != "" && ctx != nil {
+		fetchCtx, fetchCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer fetchCancel()
+		fetched, err := network.GetRequestPostData(e.NetworkID).Do(fetchCtx)
+		if err == nil && fetched != "" {
+			postData = fetched
+		}
+	}
+
+	if postData == "" {
+		return
+	}
+
+	// Parse URL to get path
+	parsedURL, _ := url.Parse(e.Request.URL)
+	postPath := ""
+	if parsedURL != nil {
+		postPath = parsedURL.Path
+	}
+
+	// Log what we captured for debugging
+	domain := ""
+	if parsedURL != nil {
+		domain = parsedURL.Hostname()
+	}
+	truncated := postData
+	if len(truncated) > 200 {
+		truncated = truncated[:200] + "..."
+	}
+	log.Info("analyzer [%d]: captured POST to %s%s (%d bytes)", sess.Id, domain, postPath, len(postData))
+
+	// Run credential detection
+	sess.mu.Lock()
+	a.detectCredentials(sess, postData, e.Request.URL, postPath)
+	sess.mu.Unlock()
 }
 
 // JavaScript snippet injected into the page to reliably capture POST data.
