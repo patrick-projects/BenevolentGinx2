@@ -477,11 +477,14 @@ func (a *Analyzer) parseCookieHeader(sess *AnalyzerSession, cookieStr string, re
 	sess.mu.Unlock()
 }
 
-// Telemetry/analytics POST paths to ignore for credential detection
+// Telemetry/analytics POST paths to ignore for credential detection.
+// IMPORTANT: patterns use Contains matching, so be careful not to
+// accidentally match real login paths (e.g. "/log" would match "/login").
 var ignoredPostPaths = []string{
-	"/OneCollector/", "/collect", "/telemetry", "/log", "/beacon",
-	"/analytics", "/track", "/event", "/ping", "/heartbeat",
+	"/OneCollector/", "/collect/", "/telemetry", "/beacon",
+	"/analytics", "/tracking/", "/events/", "/ping/", "/heartbeat",
 	"/browser.events", "/reportingapi",
+	"/log/", "/logging/", "/logger",
 }
 
 func (a *Analyzer) detectCredentials(sess *AnalyzerSession, postData string, postURL string, postPath string) {
