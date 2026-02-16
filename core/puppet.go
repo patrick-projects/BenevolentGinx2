@@ -401,14 +401,13 @@ func (pm *PuppetManager) handleMouseClick(puppet *PuppetInstance, pi PuppetInput
 		btn = input.Middle
 	}
 
-	return chromedp.Run(puppet.ctx,
+	err := chromedp.Run(puppet.ctx,
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			// Move to the target position first to trigger hover/focus states
 			if err := input.DispatchMouseEvent(input.MouseMoved, pi.X, pi.Y).
 				Do(ctx); err != nil {
 				return err
 			}
-			// Small delay to let hover handlers fire
 			time.Sleep(30 * time.Millisecond)
 
 			if err := input.DispatchMouseEvent(input.MousePressed, pi.X, pi.Y).
@@ -418,7 +417,6 @@ func (pm *PuppetManager) handleMouseClick(puppet *PuppetInstance, pi PuppetInput
 				Do(ctx); err != nil {
 				return err
 			}
-			// Small delay between press and release to simulate real click timing
 			time.Sleep(40 * time.Millisecond)
 
 			return input.DispatchMouseEvent(input.MouseReleased, pi.X, pi.Y).
@@ -428,6 +426,40 @@ func (pm *PuppetManager) handleMouseClick(puppet *PuppetInstance, pi PuppetInput
 				Do(ctx)
 		}),
 	)
+	if err != nil {
+		return err
+	}
+
+	// JavaScript fallback: find the element at click coordinates and focus/click it.
+	// This handles custom input components (like Microsoft's login) where CDP mouse
+	// events hit an overlay div instead of the actual <input> underneath.
+	var ignored interface{}
+	_ = chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
+		(function() {
+			var el = document.elementFromPoint(%f, %f);
+			if (!el) return;
+			// Walk up to find the nearest input/textarea if we hit a wrapper
+			var input = el.closest('input, textarea, [contenteditable="true"]');
+			if (!input) {
+				// Check if there's an input inside the clicked element
+				input = el.querySelector('input, textarea, [contenteditable="true"]');
+			}
+			if (input) {
+				input.focus();
+				input.click();
+				// For some frameworks, dispatching events directly helps
+				input.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+				input.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+				input.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+			} else {
+				// No input found — just click and focus whatever is there
+				el.click();
+				if (el.focus) el.focus();
+			}
+		})()
+	`, pi.X, pi.Y), &ignored))
+
+	return nil
 }
 
 func (pm *PuppetManager) handleMouseDown(puppet *PuppetInstance, pi PuppetInput) error {
