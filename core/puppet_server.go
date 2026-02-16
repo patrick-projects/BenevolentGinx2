@@ -194,6 +194,9 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 	// Set read deadline — refreshed on every message (keepalive pings extend it)
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
+	// Throttle inspect requests to avoid overloading CDP (max ~10/sec)
+	var lastInspectTime time.Time
+
 	// Read input events from the client
 	for {
 		_, message, err := conn.ReadMessage()
@@ -211,6 +214,37 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 
 		// Ignore keepalive pings
 		if pi.Type == "ping" {
+			continue
+		}
+
+		// Handle element inspector requests
+		if pi.Type == "inspect" {
+			now := time.Now()
+			if now.Sub(lastInspectTime) < 100*time.Millisecond {
+				continue // throttle: skip if less than 100ms since last inspect
+			}
+			lastInspectTime = now
+
+			info, err := ps.pm.InspectElementAt(puppetId, pi.X, pi.Y)
+			if err != nil {
+				// Send empty highlight to clear any existing overlay
+				clearMsg := map[string]interface{}{"type": "highlight", "selector": "", "rect": [4]float64{0, 0, 0, 0}}
+				clearJSON, _ := json.Marshal(clearMsg)
+				conn.WriteMessage(websocket.TextMessage, clearJSON)
+				continue
+			}
+
+			highlightMsg := map[string]interface{}{
+				"type":      "highlight",
+				"selector":  info.Selector,
+				"tag":       info.Tag,
+				"inputType": info.InputType,
+				"rect":      info.Rect,
+				"text":      info.Text,
+				"focusable": info.Focusable,
+			}
+			highlightJSON, _ := json.Marshal(highlightMsg)
+			conn.WriteMessage(websocket.TextMessage, highlightJSON)
 			continue
 		}
 
@@ -388,6 +422,36 @@ body {
     padding: 0;
     vertical-align: top;
 }
+#highlight-overlay {
+    position: absolute;
+    border: 2px solid #58a6ff;
+    background: rgba(88, 166, 255, 0.12);
+    pointer-events: none;
+    z-index: 3;
+    transition: all 0.08s ease-out;
+    display: none;
+    border-radius: 2px;
+}
+#element-tooltip {
+    position: absolute;
+    background: #161b22ee;
+    color: #c9d1d9;
+    font-size: 11px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    padding: 3px 7px;
+    border-radius: 4px;
+    border: 1px solid #30363d;
+    pointer-events: none;
+    z-index: 4;
+    display: none;
+    white-space: nowrap;
+    max-width: 350px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+#element-tooltip .tag { color: #ff7b72; }
+#element-tooltip .attr { color: #d2a8ff; }
+#element-tooltip .val { color: #a5d6ff; }
 .statusbar {
     display: flex;
     justify-content: space-between;
@@ -448,12 +512,14 @@ body {
     </div>
 </div>
 
-<div class="viewport-container">
+<div class="viewport-container" id="viewport-container">
     <div class="loading-overlay" id="loading">
         <div class="loading-spinner"></div>
         <div class="loading-text">Connecting to puppet browser...</div>
     </div>
     <img id="viewport" draggable="false">
+    <div id="highlight-overlay"></div>
+    <div id="element-tooltip"></div>
 </div>
 
 <div class="statusbar">
@@ -475,13 +541,19 @@ body {
     const fpsEl = document.getElementById('fps');
     const coordsEl = document.getElementById('coords');
     const loadingEl = document.getElementById('loading');
+    const highlightEl = document.getElementById('highlight-overlay');
+    const tooltipEl = document.getElementById('element-tooltip');
+    const containerEl = document.getElementById('viewport-container');
 
     let ws = null;
     let frameCount = 0;
     let lastFpsTime = Date.now();
-    let lastMoveTime = 0;
+    let lastInspectTime = 0;
     let reconnectDelay = 1000;
     let hasReceivedFrame = false;
+
+    // Element inspector state: stores the last highlight response from server
+    let currentElement = null; // {selector, tag, inputType, rect, focusable}
 
     function connect() {
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -493,7 +565,6 @@ body {
         ws.onopen = function() {
             setStatus('connected', 'Connected');
             reconnectDelay = 1000;
-            // Send keepalive pings to prevent idle timeout
             if (window._pingInterval) clearInterval(window._pingInterval);
             window._pingInterval = setInterval(function() {
                 if (ws && ws.readyState === WebSocket.OPEN) {
@@ -516,17 +587,14 @@ body {
 
         ws.onmessage = function(event) {
             if (event.data instanceof Blob) {
-                // Binary message = screenshot frame (JPEG)
                 if (!hasReceivedFrame) {
                     hasReceivedFrame = true;
                     loadingEl.classList.add('hidden');
                 }
-
                 const url = URL.createObjectURL(event.data);
                 const oldUrl = viewport.src;
                 viewport.src = url;
                 if (oldUrl && oldUrl.startsWith('blob:')) URL.revokeObjectURL(oldUrl);
-
                 frameCount++;
                 const now = Date.now();
                 if (now - lastFpsTime >= 1000) {
@@ -535,21 +603,101 @@ body {
                     lastFpsTime = now;
                 }
             } else {
-                // Text message = JSON control
                 try {
                     const msg = JSON.parse(event.data);
                     if (msg.type === 'url') {
-                        if (document.activeElement !== urlBar) {
-                            urlBar.value = msg.url;
-                        }
-                    } else if (msg.type === 'status') {
-                        // Initial status
+                        if (document.activeElement !== urlBar) urlBar.value = msg.url;
+                    } else if (msg.type === 'highlight') {
+                        handleHighlight(msg);
                     } else if (msg.type === 'error') {
                         console.error('Puppet error:', msg.message);
                     }
                 } catch(e) {}
             }
         };
+    }
+
+    // Render the highlight overlay and tooltip based on server response
+    function handleHighlight(msg) {
+        var rect = msg.rect;
+        if (!rect || (rect[2] === 0 && rect[3] === 0) || !msg.selector) {
+            highlightEl.style.display = 'none';
+            tooltipEl.style.display = 'none';
+            currentElement = null;
+            return;
+        }
+
+        currentElement = {
+            selector: msg.selector,
+            tag: msg.tag,
+            inputType: msg.inputType || '',
+            focusable: msg.focusable || false
+        };
+
+        // Map viewport pixel coordinates to the displayed image's CSS coordinates
+        var imgRect = viewport.getBoundingClientRect();
+        var containerRect = containerEl.getBoundingClientRect();
+        if (imgRect.width === 0 || imgRect.height === 0) return;
+
+        var targetW = viewport.naturalWidth || VIEWPORT_W;
+        var targetH = viewport.naturalHeight || VIEWPORT_H;
+        var scaleX = imgRect.width / targetW;
+        var scaleY = imgRect.height / targetH;
+
+        // Element bounding box in viewport pixels -> CSS pixels on the displayed image
+        var left = (rect[0] * scaleX) + (imgRect.left - containerRect.left);
+        var top = (rect[1] * scaleY) + (imgRect.top - containerRect.top);
+        var width = rect[2] * scaleX;
+        var height = rect[3] * scaleY;
+
+        highlightEl.style.display = 'block';
+        highlightEl.style.left = left + 'px';
+        highlightEl.style.top = top + 'px';
+        highlightEl.style.width = width + 'px';
+        highlightEl.style.height = height + 'px';
+
+        // Color the highlight based on element type
+        if (msg.focusable && (msg.tag === 'input' || msg.tag === 'textarea' || msg.tag === 'select')) {
+            highlightEl.style.borderColor = '#3fb950';
+            highlightEl.style.background = 'rgba(63, 185, 80, 0.12)';
+        } else if (msg.tag === 'button' || msg.tag === 'a' || msg.focusable) {
+            highlightEl.style.borderColor = '#d29922';
+            highlightEl.style.background = 'rgba(210, 153, 34, 0.12)';
+        } else {
+            highlightEl.style.borderColor = '#58a6ff';
+            highlightEl.style.background = 'rgba(88, 166, 255, 0.12)';
+        }
+
+        // Build tooltip text
+        var tipText = '<span class="tag">' + escHtml(msg.tag) + '</span>';
+        if (msg.inputType) {
+            tipText += '<span class="attr">[type=</span><span class="val">"' + escHtml(msg.inputType) + '"</span><span class="attr">]</span>';
+        }
+        if (msg.selector && msg.selector.indexOf('#') === 0) {
+            tipText += ' <span class="attr">' + escHtml(msg.selector) + '</span>';
+        } else if (msg.selector && msg.selector.indexOf('[name=') !== -1) {
+            var nameMatch = msg.selector.match(/\[name="([^"]+)"\]/);
+            if (nameMatch) tipText += ' <span class="attr">name=</span><span class="val">"' + escHtml(nameMatch[1]) + '"</span>';
+        }
+        tooltipEl.innerHTML = tipText;
+
+        // Position tooltip just below the highlight, or above if near bottom
+        tooltipEl.style.display = 'block';
+        var tipLeft = left;
+        var tipTop = top + height + 4;
+        if (tipTop + 25 > containerRect.height) {
+            tipTop = top - 25;
+        }
+        if (tipLeft + 200 > containerRect.width) {
+            tipLeft = containerRect.width - 210;
+        }
+        if (tipLeft < 0) tipLeft = 0;
+        tooltipEl.style.left = tipLeft + 'px';
+        tooltipEl.style.top = tipTop + 'px';
+    }
+
+    function escHtml(s) {
+        return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
     function setStatus(state, text) {
@@ -563,21 +711,14 @@ body {
     }
 
     function getScaledCoords(e) {
-        const rect = viewport.getBoundingClientRect();
+        var rect = viewport.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) return null;
 
-        // Use the actual screenshot pixel dimensions for mapping.
-        // EmulateViewport should lock these to VIEWPORT_W x VIEWPORT_H,
-        // but if the headless browser reports a slightly different size
-        // (scrollbar, toolbar, DPR mismatch), naturalWidth/Height will
-        // reflect the REAL screenshot and keep coordinates pixel-perfect.
         var targetW = viewport.naturalWidth || VIEWPORT_W;
         var targetH = viewport.naturalHeight || VIEWPORT_H;
-
         var relX = e.clientX - rect.left;
         var relY = e.clientY - rect.top;
 
-        // Clamp to the image bounds
         if (relX < 0 || relX > rect.width || relY < 0 || relY > rect.height) return null;
 
         return {
@@ -587,7 +728,7 @@ body {
     }
 
     function getModifiers(e) {
-        let mod = 0;
+        var mod = 0;
         if (e.altKey) mod |= 1;
         if (e.ctrlKey) mod |= 2;
         if (e.metaKey) mod |= 4;
@@ -596,20 +737,13 @@ body {
     }
 
     function buttonName(b) {
-        switch(b) {
-            case 0: return 'left';
-            case 1: return 'middle';
-            case 2: return 'right';
-            default: return 'left';
-        }
+        return b === 1 ? 'middle' : b === 2 ? 'right' : 'left';
     }
 
     // Mouse events on the viewport
-    // Only use 'click' for left button to avoid double-firing (mousedown+mouseup+click = 2 clicks).
-    // Right/middle clicks still use mousedown/mouseup since 'click' doesn't fire for them.
     viewport.addEventListener('mousedown', function(e) {
-        if (e.button === 0) { e.preventDefault(); return; } // Left click handled by 'click' event
-        const c = getScaledCoords(e);
+        if (e.button === 0) { e.preventDefault(); return; }
+        var c = getScaledCoords(e);
         if (!c) return;
         sendInput({type: 'mousedown', x: c.x, y: c.y, button: buttonName(e.button), modifiers: getModifiers(e)});
         e.preventDefault();
@@ -617,78 +751,105 @@ body {
 
     viewport.addEventListener('mouseup', function(e) {
         if (e.button === 0) { e.preventDefault(); return; }
-        const c = getScaledCoords(e);
+        var c = getScaledCoords(e);
         if (!c) return;
         sendInput({type: 'mouseup', x: c.x, y: c.y, button: buttonName(e.button), modifiers: getModifiers(e)});
         e.preventDefault();
     });
 
     viewport.addEventListener('click', function(e) {
-        const c = getScaledCoords(e);
+        var c = getScaledCoords(e);
         if (!c) return;
-        // Send a mousemove first to trigger hover states (required by many modern login pages)
+
+        // If the element inspector has identified an element, click by selector
+        var msg = {type: 'click', x: c.x, y: c.y, button: buttonName(e.button), modifiers: getModifiers(e)};
+        if (currentElement && currentElement.selector) {
+            msg.selector = currentElement.selector;
+        }
+
+        // Send mousemove first to trigger hover states
         sendInput({type: 'mousemove', x: c.x, y: c.y});
-        // Small delay then click — lets the hover state register before the click
-        setTimeout(function() {
-            sendInput({type: 'click', x: c.x, y: c.y, button: buttonName(e.button), modifiers: getModifiers(e)});
-        }, 50);
+        setTimeout(function() { sendInput(msg); }, 50);
         e.preventDefault();
     });
 
     viewport.addEventListener('dblclick', function(e) {
-        const c = getScaledCoords(e);
+        var c = getScaledCoords(e);
         if (!c) return;
-        sendInput({type: 'click', x: c.x, y: c.y, button: 'left', modifiers: getModifiers(e)});
-        setTimeout(function() {
-            sendInput({type: 'click', x: c.x, y: c.y, button: 'left', modifiers: getModifiers(e)});
-        }, 80);
+        var msg = {type: 'click', x: c.x, y: c.y, button: 'left', modifiers: getModifiers(e)};
+        if (currentElement && currentElement.selector) msg.selector = currentElement.selector;
+        sendInput(msg);
+        setTimeout(function() { sendInput(msg); }, 80);
         e.preventDefault();
     });
 
     viewport.addEventListener('mousemove', function(e) {
-        const now = Date.now();
-        if (now - lastMoveTime < 50) return; // Throttle to ~20/sec
-        lastMoveTime = now;
-        const c = getScaledCoords(e);
+        var now = Date.now();
+        var c = getScaledCoords(e);
         if (!c) return;
-        var diag = viewport.getBoundingClientRect();
-        coordsEl.textContent = c.x + ', ' + c.y + '  [img:' + (viewport.naturalWidth||'?') + 'x' + (viewport.naturalHeight||'?') + ' css:' + Math.round(diag.width) + 'x' + Math.round(diag.height) + ']';
-        sendInput({type: 'mousemove', x: c.x, y: c.y});
+
+        // Update coordinate display
+        coordsEl.textContent = c.x + ', ' + c.y;
+        if (currentElement) {
+            coordsEl.textContent += '  ' + currentElement.tag;
+            if (currentElement.inputType) coordsEl.textContent += '[' + currentElement.inputType + ']';
+        }
+
+        // Send mousemove for hover states (throttled ~20/sec)
+        if (now - lastInspectTime >= 50) {
+            sendInput({type: 'mousemove', x: c.x, y: c.y});
+        }
+
+        // Send inspect request (throttled ~10/sec — server also throttles)
+        if (now - lastInspectTime >= 100) {
+            lastInspectTime = now;
+            sendInput({type: 'inspect', x: c.x, y: c.y});
+        }
+    });
+
+    // Hide highlight when mouse leaves the viewport
+    viewport.addEventListener('mouseleave', function() {
+        highlightEl.style.display = 'none';
+        tooltipEl.style.display = 'none';
+        currentElement = null;
+        coordsEl.textContent = '';
     });
 
     viewport.addEventListener('wheel', function(e) {
-        const c = getScaledCoords(e);
+        var c = getScaledCoords(e);
         if (!c) return;
         sendInput({type: 'scroll', x: c.x, y: c.y, deltaX: e.deltaX, deltaY: e.deltaY});
         e.preventDefault();
     }, {passive: false});
 
-    viewport.addEventListener('contextmenu', function(e) {
-        e.preventDefault();
-    });
+    viewport.addEventListener('contextmenu', function(e) { e.preventDefault(); });
 
-    // Paste support — intercept Ctrl+V / Cmd+V and send clipboard text
+    // Paste support — include selector for targeted input
     document.addEventListener('paste', function(e) {
         if (document.activeElement === urlBar) return;
         var text = (e.clipboardData || window.clipboardData).getData('text');
         if (text) {
-            sendInput({type: 'type', text: text});
+            var msg = {type: 'type', text: text};
+            if (currentElement && currentElement.focusable && currentElement.selector) {
+                msg.selector = currentElement.selector;
+            }
+            sendInput(msg);
         }
         e.preventDefault();
     });
 
-    // Keyboard events (only when url bar is not focused)
+    // Keyboard events
     document.addEventListener('keydown', function(e) {
         if (document.activeElement === urlBar) return;
-
-        // Let paste event handle Ctrl+V / Cmd+V
         if ((e.ctrlKey || e.metaKey) && e.key === 'v') return;
 
         if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
-            // Printable character
-            sendInput({type: 'type', text: e.key});
+            var msg = {type: 'type', text: e.key};
+            if (currentElement && currentElement.focusable && currentElement.selector) {
+                msg.selector = currentElement.selector;
+            }
+            sendInput(msg);
         } else {
-            // Special key
             sendInput({type: 'keydown', key: e.key, code: e.code, modifiers: getModifiers(e)});
         }
         e.preventDefault();
@@ -704,17 +865,10 @@ body {
     });
 
     // Navigation buttons
-    document.getElementById('btn-back').addEventListener('click', function() {
-        sendInput({type: 'back'});
-    });
-    document.getElementById('btn-forward').addEventListener('click', function() {
-        sendInput({type: 'forward'});
-    });
-    document.getElementById('btn-refresh').addEventListener('click', function() {
-        sendInput({type: 'refresh'});
-    });
+    document.getElementById('btn-back').addEventListener('click', function() { sendInput({type: 'back'}); });
+    document.getElementById('btn-forward').addEventListener('click', function() { sendInput({type: 'forward'}); });
+    document.getElementById('btn-refresh').addEventListener('click', function() { sendInput({type: 'refresh'}); });
 
-    // URL bar navigation
     urlBar.addEventListener('keydown', function(e) {
         if (e.key === 'Enter') {
             sendInput({type: 'navigate', url: urlBar.value});
@@ -722,7 +876,6 @@ body {
         }
     });
 
-    // Start connection
     connect();
 })();
 </script>
