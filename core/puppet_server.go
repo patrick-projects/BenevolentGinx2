@@ -566,9 +566,14 @@ body {
         const rect = viewport.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) return null;
 
-        // With max-width/max-height (no object-fit), the <img> element
-        // sizes itself to exactly match the rendered content area.
-        // getBoundingClientRect() IS the content area — no letterbox offset needed.
+        // Use the actual screenshot pixel dimensions for mapping.
+        // EmulateViewport should lock these to VIEWPORT_W x VIEWPORT_H,
+        // but if the headless browser reports a slightly different size
+        // (scrollbar, toolbar, DPR mismatch), naturalWidth/Height will
+        // reflect the REAL screenshot and keep coordinates pixel-perfect.
+        var targetW = viewport.naturalWidth || VIEWPORT_W;
+        var targetH = viewport.naturalHeight || VIEWPORT_H;
+
         var relX = e.clientX - rect.left;
         var relY = e.clientY - rect.top;
 
@@ -576,8 +581,8 @@ body {
         if (relX < 0 || relX > rect.width || relY < 0 || relY > rect.height) return null;
 
         return {
-            x: Math.round((relX / rect.width) * VIEWPORT_W),
-            y: Math.round((relY / rect.height) * VIEWPORT_H)
+            x: Math.round((relX / rect.width) * targetW),
+            y: Math.round((relY / rect.height) * targetH)
         };
     }
 

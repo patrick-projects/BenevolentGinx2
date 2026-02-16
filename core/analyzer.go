@@ -243,6 +243,12 @@ func (a *Analyzer) runRecording(sess *AnalyzerSession) {
 		return
 	}
 
+	// Explicitly lock the viewport dimensions via CDP so that screenshots
+	// are guaranteed to be exactly viewportW x viewportH pixels.
+	if err := chromedp.Run(ctx, chromedp.EmulateViewport(int64(sess.viewportW), int64(sess.viewportH))); err != nil {
+		log.Warning("analyzer [%d]: failed to lock viewport metrics: %v", sess.Id, err)
+	}
+
 	// Listen for network requests
 	chromedp.ListenTarget(ctx, func(ev interface{}) {
 		switch e := ev.(type) {
