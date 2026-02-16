@@ -2259,19 +2259,35 @@ func (t *Terminal) checkStatus() {
 
 	if !hasPhishlets {
 		log.Warning("no phishlets found in phishlets directory")
-		log.Info("%s  add .yaml phishlet files to the phishlets/ directory and restart", dgray.Sprint("step 3 →"))
-		log.Info("")
-		log.Info("%s  community phishlets: %s", dgray.Sprint("       "), cyan.Sprint("https://github.com/An0nUD4Y/Evilginx2-Phishlets"))
-		log.Info("%s  copy to server:      %s", dgray.Sprint("       "), cyan.Sprint("scp phishlet.yaml root@<server>:/opt/evilginx/phishlets/"))
-		log.Info("")
-		log.Info("%s  then restart evilginx to load the new phishlet", dgray.Sprint("       "))
+		t.printGetPhishletHelp(dgray, cyan, yellow)
+		return
+	}
+
+	// Check if the only phishlets are placeholders (like "example")
+	hasRealPhishlet := false
+	placeholderNames := map[string]bool{"example": true, "test": true, "sample": true}
+	var realNames []string
+	for _, name := range t.cfg.GetPhishletNames() {
+		if !placeholderNames[name] {
+			hasRealPhishlet = true
+			realNames = append(realNames, name)
+		}
+	}
+
+	if !hasRealPhishlet {
+		t.printGetPhishletHelp(dgray, cyan, yellow)
 		return
 	}
 
 	if enabledCount == 0 {
-		log.Info("%s  %s", dgray.Sprint("step 3 →"), cyan.Sprint("phishlets enable <name>"))
-		log.Info("%s  run %s to see available phishlets", dgray.Sprint("       "), cyan.Sprint("phishlets"))
+		nameList := strings.Join(realNames, ", ")
+		log.Info("%s  %s", dgray.Sprint("step 3 →"), cyan.Sprint("phishlets enable "+realNames[0]))
+		if len(realNames) > 1 {
+			log.Info("%s  available: %s", dgray.Sprint("       "), yellow.Sprint(nameList))
+		}
 		log.Info("%s  hostname is auto-set from your domain (%s)", dgray.Sprint("       "), yellow.Sprint(t.cfg.GetBaseDomain()))
+		log.Info("")
+		log.Info("%s  or build a new one: %s", dgray.Sprint("       "), cyan.Sprint("phishlets analyze <login_url>"))
 		return
 	}
 
@@ -2313,6 +2329,22 @@ func (t *Terminal) checkStatus() {
 			cyan.Sprint("sessions"),
 			cyan.Sprint("puppet launch <session_id> <url>"))
 	}
+}
+
+func (t *Terminal) printGetPhishletHelp(dgray, cyan, yellow *color.Color) {
+	higreen := color.New(color.FgHiGreen)
+	log.Info("%s  you need a phishlet to target a login page", dgray.Sprint("step 3 →"))
+	log.Info("")
+	log.Info("%s  %s  %s", dgray.Sprint("       "), higreen.Sprint("option A:"), cyan.Sprint("build one automatically with the login flow analyzer"))
+	log.Info("%s             %s", dgray.Sprint("       "), cyan.Sprint("phishlets analyze https://login.example.com"))
+	log.Info("%s             interact with the login page via the puppet UI, then:", dgray.Sprint("       "))
+	log.Info("%s             %s", dgray.Sprint("       "), cyan.Sprint("phishlets analyze stop"))
+	log.Info("")
+	log.Info("%s  %s  %s", dgray.Sprint("       "), higreen.Sprint("option B:"), cyan.Sprint("copy a phishlet YAML to this server"))
+	log.Info("%s             %s", dgray.Sprint("       "), cyan.Sprint("scp myphishlet.yaml root@<server>:/opt/evilginx/phishlets/"))
+	log.Info("%s             then restart evilginx to load it", dgray.Sprint("       "))
+	log.Info("")
+	log.Info("%s  community phishlets: %s", dgray.Sprint("       "), cyan.Sprint("https://github.com/An0nUD4Y/Evilginx2-Phishlets"))
 }
 
 func (t *Terminal) manageCertificates(verbose bool) {
