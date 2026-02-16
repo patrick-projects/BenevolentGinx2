@@ -525,24 +525,79 @@ func (pm *PuppetManager) HandleInput(puppetId int, pi PuppetInput) error {
 }
 
 // handleCSSClick clicks an element in the puppet browser identified by its CSS selector path.
+// It scrolls the element into view, computes its center coordinates, and dispatches real
+// mousePressed/mouseReleased events — matching Puppeteer's page.click() behavior so that
+// framework event handlers (React, Angular, etc.) see a genuine mouse event sequence.
 func (pm *PuppetManager) handleCSSClick(puppet *PuppetInstance, pi PuppetInput) error {
 	if pi.CSSPath == "" {
 		return nil
 	}
 	cssPathJSON, _ := json.Marshal(pi.CSSPath)
-	var ignored interface{}
-	return chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
+
+	// Step 1: Find element, scroll into view, get center coordinates and tag info
+	var resultJSON string
+	err := chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
 		(function(path) {
 			var el = document.querySelector(path);
-			if (!el) return false;
-			el.click();
-			if (el.focus) el.focus();
-			if ((el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && el.value !== undefined) {
-				el.selectionStart = el.selectionEnd = el.value.length;
-			}
-			return true;
+			if (!el) return JSON.stringify({found: false});
+			el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
+			var rect = el.getBoundingClientRect();
+			return JSON.stringify({
+				found: true,
+				x: rect.left + rect.width / 2,
+				y: rect.top + rect.height / 2,
+				tag: el.tagName
+			});
 		})(%s)
-	`, string(cssPathJSON)), &ignored))
+	`, string(cssPathJSON)), &resultJSON))
+	if err != nil {
+		return err
+	}
+
+	var pos struct {
+		Found bool    `json:"found"`
+		X     float64 `json:"x"`
+		Y     float64 `json:"y"`
+		Tag   string  `json:"tag"`
+	}
+	if err := json.Unmarshal([]byte(resultJSON), &pos); err != nil || !pos.Found {
+		return fmt.Errorf("element not found: %s", pi.CSSPath)
+	}
+
+	// Step 2: Dispatch real mouse events at the element's center (like Puppeteer)
+	err = chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		if err := input.DispatchMouseEvent(input.MousePressed, pos.X, pos.Y).
+			WithButton(input.Left).
+			WithClickCount(1).
+			Do(ctx); err != nil {
+			return err
+		}
+		return input.DispatchMouseEvent(input.MouseReleased, pos.X, pos.Y).
+			WithButton(input.Left).
+			WithClickCount(1).
+			Do(ctx)
+	}))
+	if err != nil {
+		return err
+	}
+
+	// Step 3: For input/textarea elements, ensure focus and cursor at end
+	if pos.Tag == "INPUT" || pos.Tag == "TEXTAREA" {
+		var ignored interface{}
+		chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
+			(function(path) {
+				var el = document.querySelector(path);
+				if (el) {
+					el.focus();
+					if (el.value !== undefined) {
+						el.selectionStart = el.selectionEnd = el.value.length;
+					}
+				}
+			})(%s)
+		`, string(cssPathJSON)), &ignored))
+	}
+
+	return nil
 }
 
 // handleKeyPress handles a key press event (EvilPuppetJS-style: single press = down+char+up).

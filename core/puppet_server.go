@@ -579,7 +579,10 @@ body {
                     var tag = f.tagName;
                     if (tag === 'INPUT' || tag === 'TEXTAREA') {
                         var serverVal = t.getAttribute('value') || '';
-                        if (f.value !== serverVal) f.value = serverVal;
+                        if (f.value !== serverVal) {
+                            f.value = serverVal;
+                            try { f.selectionStart = f.selectionEnd = f.value.length; } catch(ce) {}
+                        }
                         continue;
                     }
                     if (tag === 'SELECT') continue;
