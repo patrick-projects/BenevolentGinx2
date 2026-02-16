@@ -227,7 +227,7 @@ func main() {
 
 	log.Info("EvilPuppet ready on port %d (password: %s)", puppet.GetPort(), puppet.GetPassword())
 
-	t, err := core.NewTerminal(hp, cfg, crt_db, db, *developer_mode, puppet)
+	t, err := core.NewTerminal(hp, cfg, crt_db, db, *developer_mode, puppet, phishlets_path)
 	if err != nil {
 		log.Fatal("%v", err)
 		return
