@@ -471,7 +471,22 @@ func (a *Analyzer) parseCookieHeader(sess *AnalyzerSession, cookieStr string, re
 	sess.mu.Unlock()
 }
 
+// Telemetry/analytics POST paths to ignore for credential detection
+var ignoredPostPaths = []string{
+	"/OneCollector/", "/collect", "/telemetry", "/log", "/beacon",
+	"/analytics", "/track", "/event", "/ping", "/heartbeat",
+	"/browser.events", "/reportingapi",
+}
+
 func (a *Analyzer) detectCredentials(sess *AnalyzerSession, postData string, postURL string, postPath string) {
+	// Skip telemetry/analytics endpoints — they contain userId fields but not login credentials
+	postPathLower := strings.ToLower(postPath)
+	for _, ignored := range ignoredPostPaths {
+		if strings.Contains(postPathLower, strings.ToLower(ignored)) {
+			return
+		}
+	}
+
 	trimmed := strings.TrimSpace(postData)
 
 	// Try JSON first (Microsoft, Google, and many modern sites use JSON POST bodies)
@@ -911,28 +926,72 @@ func (a *Analyzer) Analyze(sess *AnalyzerSession) *AnalysisResult {
 		})
 	}
 
-	// Build credentials from detected POST fields
-	seenFields := make(map[string]bool)
+	// Build credentials from detected POST fields.
+	// Prefer fields from the POST path that contains BOTH username AND password
+	// (that's the real login endpoint, not pre-check endpoints like GetCredentialType).
+	type credsByPath struct {
+		path     string
+		postURL  string
+		userKeys []string
+		passKeys []string
+	}
+	pathMap := make(map[string]*credsByPath)
 	for _, cred := range sess.creds {
-		if seenFields[cred.Key] {
-			continue
+		cp, ok := pathMap[cred.PostPath]
+		if !ok {
+			cp = &credsByPath{path: cred.PostPath, postURL: cred.PostURL}
+			pathMap[cred.PostPath] = cp
 		}
-		seenFields[cred.Key] = true
+		if cred.FieldType == "username" {
+			cp.userKeys = append(cp.userKeys, cred.Key)
+		} else if cred.FieldType == "password" {
+			cp.passKeys = append(cp.passKeys, cred.Key)
+		}
+	}
 
-		result.Credentials = append(result.Credentials, AnalyzedCredential{
-			Name:      cred.FieldType,
-			Key:       cred.Key,
-			Search:    "(.*)",
-			FieldType: "post",
-		})
-
-		// Use the POST URL for login domain/path
-		if cred.FieldType == "username" || (result.LoginDomain == "" && cred.FieldType == "password") {
-			postParsed, _ := url.Parse(cred.PostURL)
-			if postParsed != nil {
-				result.LoginDomain = postParsed.Hostname()
-				result.LoginPath = postParsed.Path
+	// Find the best login path (has both username + password)
+	var bestPath *credsByPath
+	for _, cp := range pathMap {
+		if len(cp.userKeys) > 0 && len(cp.passKeys) > 0 {
+			bestPath = cp
+			break
+		}
+	}
+	// Fallback: use any path with a password field
+	if bestPath == nil {
+		for _, cp := range pathMap {
+			if len(cp.passKeys) > 0 {
+				bestPath = cp
+				break
 			}
+		}
+	}
+	// Last fallback: any path with credentials
+	if bestPath == nil {
+		for _, cp := range pathMap {
+			if len(cp.userKeys) > 0 || len(cp.passKeys) > 0 {
+				bestPath = cp
+				break
+			}
+		}
+	}
+
+	if bestPath != nil {
+		// Use first username and password key from the best path
+		if len(bestPath.userKeys) > 0 {
+			result.Credentials = append(result.Credentials, AnalyzedCredential{
+				Name: "username", Key: bestPath.userKeys[0], Search: "(.*)", FieldType: "post",
+			})
+		}
+		if len(bestPath.passKeys) > 0 {
+			result.Credentials = append(result.Credentials, AnalyzedCredential{
+				Name: "password", Key: bestPath.passKeys[0], Search: "(.*)", FieldType: "post",
+			})
+		}
+		postParsed, _ := url.Parse(bestPath.postURL)
+		if postParsed != nil {
+			result.LoginDomain = postParsed.Hostname()
+			result.LoginPath = postParsed.Path
 		}
 	}
 

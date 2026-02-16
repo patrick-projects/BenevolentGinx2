@@ -2227,10 +2227,10 @@ func (t *Terminal) tokensToJSON(tokens map[string]string) string {
 }
 
 func (t *Terminal) checkStatus() {
-	// Don't show setup guidance while the analyzer is actively recording
+	// Don't show setup guidance while the analyzer is active or just finished
 	if t.analyzer != nil {
 		for _, s := range t.analyzer.GetActiveSessions() {
-			if s.Status == "recording" {
+			if s.Status == "recording" || s.Status == "done" || s.Status == "analyzing" {
 				return
 			}
 		}
