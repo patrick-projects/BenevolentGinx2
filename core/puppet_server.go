@@ -561,37 +561,18 @@ body {
         const rect = viewport.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) return null;
 
-        // The image maintains aspect ratio, so we need to calculate the
-        // actual rendered content area within the element's bounding box.
-        var imgW = viewport.naturalWidth || VIEWPORT_W;
-        var imgH = viewport.naturalHeight || VIEWPORT_H;
-        var imgAspect = imgW / imgH;
-        var boxAspect = rect.width / rect.height;
+        // With max-width/max-height (no object-fit), the <img> element
+        // sizes itself to exactly match the rendered content area.
+        // getBoundingClientRect() IS the content area — no letterbox offset needed.
+        var relX = e.clientX - rect.left;
+        var relY = e.clientY - rect.top;
 
-        var renderW, renderH, offsetX, offsetY;
-        if (imgAspect > boxAspect) {
-            // Image is wider than box — letterboxed top/bottom
-            renderW = rect.width;
-            renderH = rect.width / imgAspect;
-            offsetX = 0;
-            offsetY = (rect.height - renderH) / 2;
-        } else {
-            // Image is taller than box — pillarboxed left/right
-            renderH = rect.height;
-            renderW = rect.height * imgAspect;
-            offsetX = (rect.width - renderW) / 2;
-            offsetY = 0;
-        }
-
-        var relX = e.clientX - rect.left - offsetX;
-        var relY = e.clientY - rect.top - offsetY;
-
-        // Clamp to the rendered image area
-        if (relX < 0 || relX > renderW || relY < 0 || relY > renderH) return null;
+        // Clamp to the image bounds
+        if (relX < 0 || relX > rect.width || relY < 0 || relY > rect.height) return null;
 
         return {
-            x: Math.round((relX / renderW) * VIEWPORT_W),
-            y: Math.round((relY / renderH) * VIEWPORT_H)
+            x: Math.round((relX / rect.width) * VIEWPORT_W),
+            y: Math.round((relY / rect.height) * VIEWPORT_H)
         };
     }
 
