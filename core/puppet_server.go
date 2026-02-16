@@ -572,14 +572,18 @@ body {
                 continue;
             }
             if (f.nodeType === 1) {
-                // Skip actively focused input/textarea to preserve user typing
+                morphAttributes(f, t);
+                // For focused inputs, sync the .value property from the server
+                // but skip recursive child morphing to avoid cursor disruption
                 if (iframeDoc && f === iframeDoc.activeElement) {
                     var tag = f.tagName;
-                    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+                    if (tag === 'INPUT' || tag === 'TEXTAREA') {
+                        var serverVal = t.getAttribute('value') || '';
+                        if (f.value !== serverVal) f.value = serverVal;
                         continue;
                     }
+                    if (tag === 'SELECT') continue;
                 }
-                morphAttributes(f, t);
                 morphChildren(f, t);
             }
         }
@@ -632,12 +636,15 @@ body {
         if (!iframeDoc) return;
         try {
             var el = iframeDoc.querySelector(update.cssPath);
-            if (el && el !== iframeDoc.activeElement) {
-                el.value = update.value;
-                if (update.selectionStart !== undefined) {
+            if (!el) return;
+            // Always apply server-side value — keydown is preventDefault'd locally
+            // so this is the only way typed characters appear in the iframe
+            el.value = update.value;
+            if (update.selectionStart !== undefined) {
+                try {
                     el.selectionStart = update.selectionStart;
                     el.selectionEnd = update.selectionEnd;
-                }
+                } catch(se) {} // some input types (date, etc.) don't support selection
             }
         } catch(e) {}
     }
