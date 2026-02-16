@@ -2298,10 +2298,13 @@ func getSessionCookieName(pl_name string, cookie_name string) string {
 // unescapeCssUrls finds CSS url(...) declarations and unescapes CSS escape sequences within them.
 // This defeats CSS canary tokens that use escaped strings to bypass sub_filter pattern matching.
 func unescapeCssUrls(body []byte) []byte {
-	cssUrlRe := regexp.MustCompile(`(?i)url\s*\(\s*(['"]?)([^)]*?)\1\s*\)`)
+	// Match url(...) with optional quotes — Go RE2 doesn't support backreferences,
+	// so we match any quote style and strip quotes in the handler.
+	cssUrlRe := regexp.MustCompile(`(?i)url\s*\(\s*(['"]?)([^)]*?)\s*\)`)
+	cssEscRe := regexp.MustCompile(`\\([0-9a-fA-F]{1,6})\s?`)
+	simpleEscRe := regexp.MustCompile(`\\([^0-9a-fA-F])`)
 
 	return []byte(cssUrlRe.ReplaceAllStringFunc(string(body), func(match string) string {
-		// Extract the URL part from url('...')
 		inner := cssUrlRe.FindStringSubmatch(match)
 		if inner == nil || len(inner) < 3 {
 			return match
@@ -2309,8 +2312,12 @@ func unescapeCssUrls(body []byte) []byte {
 		quote := inner[1]
 		urlVal := inner[2]
 
+		// Strip trailing quote if present (since we can't use backreference to match pairs)
+		if quote != "" && strings.HasSuffix(urlVal, quote) {
+			urlVal = urlVal[:len(urlVal)-len(quote)]
+		}
+
 		// Unescape CSS escape sequences: \XX (hex) -> character
-		cssEscRe := regexp.MustCompile(`\\([0-9a-fA-F]{1,6})\s?`)
 		unescaped := cssEscRe.ReplaceAllStringFunc(urlVal, func(esc string) string {
 			hexPart := strings.TrimSpace(esc[1:])
 			var r rune
@@ -2322,7 +2329,6 @@ func unescapeCssUrls(body []byte) []byte {
 		})
 
 		// Also unescape simple backslash escapes: \. \/ \: etc
-		simpleEscRe := regexp.MustCompile(`\\([^0-9a-fA-F])`)
 		unescaped = simpleEscRe.ReplaceAllString(unescaped, "$1")
 
 		return fmt.Sprintf("url(%s%s%s)", quote, unescaped, quote)
