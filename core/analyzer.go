@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -301,28 +302,22 @@ func (a *Analyzer) handleRequest(sess *AnalyzerSession, e *network.EventRequestW
 		return
 	}
 
-	// Extract post data from PostDataEntries
+	// Extract post data from PostDataEntries (base64-encoded)
 	postData := ""
 	if e.Request.HasPostData && len(e.Request.PostDataEntries) > 0 {
 		var parts []string
 		for _, entry := range e.Request.PostDataEntries {
 			if entry.Bytes != "" {
-				parts = append(parts, entry.Bytes)
+				decoded, err := base64.StdEncoding.DecodeString(entry.Bytes)
+				if err == nil {
+					parts = append(parts, string(decoded))
+				} else {
+					// May not be base64 in some versions, try raw
+					parts = append(parts, entry.Bytes)
+				}
 			}
 		}
 		postData = strings.Join(parts, "")
-	}
-
-	// If PostDataEntries were empty but HasPostData is set, try fetching via CDP
-	if e.Request.HasPostData && postData == "" {
-		go func() {
-			fetchedData, fetchErr := network.GetRequestPostData(e.RequestID).Do(sess.ctx)
-			if fetchErr == nil && fetchedData != "" {
-				sess.mu.Lock()
-				a.detectCredentials(sess, fetchedData, reqURL, parsedURL.Path)
-				sess.mu.Unlock()
-			}
-		}()
 	}
 
 	rec := RecordedRequest{
@@ -364,11 +359,37 @@ func (a *Analyzer) handleRequest(sess *AnalyzerSession, e *network.EventRequestW
 	}
 	ds.RequestCount++
 
-	// Check POST data for credential fields
+	// Check POST data for credential fields (inline from PostDataEntries)
 	if e.Request.Method == "POST" && postData != "" {
 		a.detectCredentials(sess, postData, reqURL, parsedURL.Path)
 	}
 	sess.mu.Unlock()
+
+	// Also fetch post data via CDP as backup (handles cases where PostDataEntries
+	// is empty or base64 decoding failed). Run async with a small delay.
+	if e.Request.HasPostData && e.Request.Method == "POST" {
+		requestID := e.RequestID
+		go func() {
+			time.Sleep(200 * time.Millisecond) // Let the request finish
+			fetchCtx, fetchCancel := context.WithTimeout(sess.ctx, 2*time.Second)
+			defer fetchCancel()
+			fetchedData, fetchErr := network.GetRequestPostData(requestID).Do(fetchCtx)
+			if fetchErr != nil || fetchedData == "" {
+				return
+			}
+			sess.mu.Lock()
+			// Only process if we didn't already find creds from PostDataEntries
+			a.detectCredentials(sess, fetchedData, reqURL, parsedURL.Path)
+			// Update the stored request's PostData if it was empty
+			for i := range sess.requests {
+				if sess.requests[i].RequestId == string(requestID) && sess.requests[i].PostData == "" {
+					sess.requests[i].PostData = fetchedData
+					break
+				}
+			}
+			sess.mu.Unlock()
+		}()
+	}
 }
 
 func (a *Analyzer) handleResponse(sess *AnalyzerSession, e *network.EventResponseReceived) {
@@ -501,7 +522,16 @@ func flattenJSON(prefix string, obj map[string]interface{}, out url.Values) {
 }
 
 func (a *Analyzer) checkFieldNames(sess *AnalyzerSession, values url.Values, postURL string, postPath string) {
+	// Build set of already-detected keys to avoid duplicates
+	seen := make(map[string]bool)
+	for _, c := range sess.creds {
+		seen[c.Key] = true
+	}
+
 	for key := range values {
+		if seen[key] {
+			continue
+		}
 		keyLower := strings.ToLower(key)
 		// Also check the last segment of dotted keys (e.g. "credentials.passwd" → "passwd")
 		keyParts := strings.Split(keyLower, ".")
@@ -514,6 +544,7 @@ func (a *Analyzer) checkFieldNames(sess *AnalyzerSession, values url.Values, pos
 				PostURL:   postURL,
 				PostPath:  postPath,
 			})
+			seen[key] = true
 			log.Info("analyzer [%d]: detected username field: %s (POST %s)", sess.Id, key, postPath)
 		}
 		if passwordFields[key] || passwordFields[keyLower] || passwordFields[keyShort] {
@@ -523,6 +554,7 @@ func (a *Analyzer) checkFieldNames(sess *AnalyzerSession, values url.Values, pos
 				PostURL:   postURL,
 				PostPath:  postPath,
 			})
+			seen[key] = true
 			log.Info("analyzer [%d]: detected password field: %s (POST %s)", sess.Id, key, postPath)
 		}
 	}
