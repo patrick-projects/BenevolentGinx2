@@ -116,7 +116,7 @@ func (rc *ResourceCache) FetchAndCache(rawURL string) (*CachedResource, error) {
 	return res, nil
 }
 
-var cssURLRegex = regexp.MustCompile(`url\(\s*(['"]?)([^'")\s]+)\1\s*\)`)
+var cssURLRegex = regexp.MustCompile(`url\(\s*(['"]?)([^'")\s]+)['"]?\s*\)`)
 
 // rewriteCSSURLs rewrites url() references in CSS content to go through the resource proxy.
 func (rc *ResourceCache) rewriteCSSURLs(css string, baseURL string) string {
