@@ -578,27 +578,35 @@ func (pm *PuppetManager) handleCSSClick(puppet *PuppetInstance, pi PuppetInput) 
 	log.Info("puppet [%d]: clicking %s#%s at (%.0f,%.0f) size %.0fx%.0f", puppet.Id, pos.Tag, pos.ID, pos.X, pos.Y, pos.W, pos.H)
 
 	// Step 2: Dispatch trusted CDP mouse events at the element's center
-	// mouseMoved → short pause → mousePressed → mouseReleased
+	// mouseMoved → mousePressed (buttons=1) → mouseReleased (buttons=0)
+	// The buttons bitmask is critical: Chrome won't synthesize a click event
+	// unless mousePressed has buttons=1 (left button held).
 	err = chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 		// Move mouse to element (some sites require prior mouse movement)
-		if err := input.DispatchMouseEvent(input.MouseMoved, pos.X, pos.Y).Do(ctx); err != nil {
+		if err := input.DispatchMouseEvent(input.MouseMoved, pos.X, pos.Y).
+			WithPointerType(input.Mouse).
+			Do(ctx); err != nil {
 			return err
 		}
 		time.Sleep(50 * time.Millisecond)
 
-		// Press
+		// Press — buttons=1 means "left button is currently held down"
 		if err := input.DispatchMouseEvent(input.MousePressed, pos.X, pos.Y).
 			WithButton(input.Left).
+			WithButtons(1).
 			WithClickCount(1).
+			WithPointerType(input.Mouse).
 			Do(ctx); err != nil {
 			return err
 		}
 		time.Sleep(30 * time.Millisecond)
 
-		// Release
+		// Release — buttons=0 means "no buttons held"
 		return input.DispatchMouseEvent(input.MouseReleased, pos.X, pos.Y).
 			WithButton(input.Left).
+			WithButtons(0).
 			WithClickCount(1).
+			WithPointerType(input.Mouse).
 			Do(ctx)
 	}))
 	if err != nil {
