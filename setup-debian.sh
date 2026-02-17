@@ -53,6 +53,97 @@ case "$MACHINE" in
     *)       error "Unsupported architecture: $MACHINE"; exit 1 ;;
 esac
 
+# ─── Step 0: Clean up leftover artifacts ─────────────────────────────
+step "Cleaning up leftover artifacts to free disk space"
+FREED=0
+
+# Go build cache (can grow to hundreds of MB)
+if [ -d "/root/.cache/go-build" ]; then
+    SZ=$(du -sm /root/.cache/go-build 2>/dev/null | awk '{print $1}')
+    rm -rf /root/.cache/go-build
+    FREED=$((FREED + SZ))
+    info "Cleared Go build cache (${SZ}MB)"
+fi
+
+# Go module cache
+if [ -d "/root/go/pkg/mod" ]; then
+    SZ=$(du -sm /root/go/pkg/mod 2>/dev/null | awk '{print $1}')
+    rm -rf /root/go/pkg/mod
+    FREED=$((FREED + SZ))
+    info "Cleared Go module cache (${SZ}MB)"
+fi
+
+# Previous build artifacts in the source directory
+for f in "$SCRIPT_DIR/build/evilginx" "$SCRIPT_DIR/evilginx2" "$SCRIPT_DIR/evilginx"; do
+    if [ -f "$f" ]; then
+        SZ=$(du -sm "$f" 2>/dev/null | awk '{print $1}')
+        rm -f "$f"
+        FREED=$((FREED + SZ))
+        info "Removed old binary: $f (${SZ}MB)"
+    fi
+done
+
+# Stale vendor directory (will be recreated by go mod vendor)
+if [ -d "$SCRIPT_DIR/vendor" ]; then
+    SZ=$(du -sm "$SCRIPT_DIR/vendor" 2>/dev/null | awk '{print $1}')
+    rm -rf "$SCRIPT_DIR/vendor"
+    FREED=$((FREED + SZ))
+    info "Cleared stale vendor directory (${SZ}MB)"
+fi
+
+# APT package cache
+if [ -d "/var/cache/apt/archives" ]; then
+    SZ=$(du -sm /var/cache/apt/archives 2>/dev/null | awk '{print $1}')
+    apt-get clean -qq 2>/dev/null || true
+    NEWZ=$(du -sm /var/cache/apt/archives 2>/dev/null | awk '{print $1}')
+    DIFF=$((SZ - NEWZ))
+    if [ "$DIFF" -gt 0 ]; then
+        FREED=$((FREED + DIFF))
+        info "Cleaned APT cache (${DIFF}MB)"
+    fi
+fi
+
+# Old systemd journal logs (keep only last 50MB)
+if command -v journalctl &>/dev/null; then
+    journalctl --vacuum-size=50M >/dev/null 2>&1 && info "Trimmed systemd journal to 50MB"
+fi
+
+# Chromium crash dumps and temp data from previous puppet sessions
+for d in /root/.config/chromium/Crash\ Reports /tmp/.org.chromium.Chromium* /tmp/chromium-* /tmp/puppeteer_dev_chrome_profile-*; do
+    if [ -e "$d" ]; then
+        SZ=$(du -sm "$d" 2>/dev/null | awk '{print $1}')
+        rm -rf "$d"
+        FREED=$((FREED + SZ))
+        info "Removed Chromium temp: $d (${SZ}MB)"
+    fi
+done
+
+# Old Go tarballs left in /tmp
+for f in /tmp/go*.linux-*.tar.gz; do
+    if [ -f "$f" ]; then
+        SZ=$(du -sm "$f" 2>/dev/null | awk '{print $1}')
+        rm -f "$f"
+        FREED=$((FREED + SZ))
+        info "Removed old Go tarball: $f (${SZ}MB)"
+    fi
+done
+
+# Orphaned snap cache (if snap is present)
+if command -v snap &>/dev/null; then
+    snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}' | while read snapname revision; do
+        snap remove "$snapname" --revision="$revision" 2>/dev/null && info "Removed old snap revision: $snapname ($revision)"
+    done
+fi
+
+if [ "$FREED" -gt 0 ]; then
+    info "Total freed: ~${FREED}MB"
+else
+    info "Nothing significant to clean up"
+fi
+
+# Show current disk usage
+info "Disk usage: $(df -h / | awk 'NR==2{print $3 " used / " $2 " total (" $5 " full)"}')"
+
 # ─── Step 1: System packages ────────────────────────────────────────
 step "Installing system dependencies"
 apt-get update -qq
