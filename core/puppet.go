@@ -597,6 +597,20 @@ func (pm *PuppetManager) handleClick(puppet *PuppetInstance, pi PuppetInput) err
 		defer cancel()
 		err := chromedp.Run(ctx, chromedp.Click(pi.CSSPath, chromedp.ByQuery))
 		if err == nil {
+			// After clicking, explicitly focus the element if it's an input/textarea/select.
+			// Some sites prevent auto-focus from clicks, or CDP mouse events may not
+			// transfer keyboard focus reliably. This ensures we can type into the element.
+			cssPathJSON, _ := json.Marshal(pi.CSSPath)
+			var ignored interface{}
+			chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`(function() {
+				var el = document.querySelector(%s);
+				if (el) {
+					var tag = el.tagName;
+					if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+						el.focus();
+					}
+				}
+			})()`, string(cssPathJSON)), &ignored))
 			return nil
 		}
 		log.Warning("puppet [%d]: CSS click failed (%v), falling back to coordinates (%.0f, %.0f)", puppet.Id, err, pi.X, pi.Y)
@@ -628,7 +642,34 @@ func (pm *PuppetManager) handleClick(puppet *PuppetInstance, pi PuppetInput) err
 	}))
 }
 
-// handleKeyPress handles a key press event (EvilPuppetJS-style: single press = down+char+up).
+// ensureFocus ensures the given CSS selector element has focus in the puppet browser.
+// This is critical because CDP key events go to whatever element has focus. Without
+// explicit focus management, typing can silently fail if focus drifted between the
+// click and the keypress. EvilPuppetJS sends cssPath with every keypress for this reason.
+func ensureFocus(ctx context.Context, puppetCtx context.Context, cssPath string) {
+	if cssPath == "" {
+		return
+	}
+	cssPathJSON, _ := json.Marshal(cssPath)
+	var focusedTag string
+	chromedp.Run(puppetCtx, chromedp.Evaluate(fmt.Sprintf(`(function() {
+		var el = document.querySelector(%s);
+		if (!el) return 'NOT_FOUND';
+		var active = document.activeElement;
+		if (active === el) return el.tagName;
+		el.focus();
+		return 'FOCUSED:' + el.tagName;
+	})()`, string(cssPathJSON)), &focusedTag))
+	if focusedTag != "" {
+		log.Info("puppet: ensureFocus(%s) → %s", cssPath, focusedTag)
+	}
+}
+
+// handleKeyPress handles a key press event.
+// Matches Puppeteer's keyboard.press() exactly: KeyDown(with text) + KeyUp.
+// The text parameter on KeyDown tells Chrome to perform text insertion,
+// generating keydown → keypress → input events — the full native sequence.
+// InsertText (sendCharacter) is used only as a fallback for edge cases.
 func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) error {
 	keyName := pi.Key
 	if keyName == "" {
@@ -637,7 +678,13 @@ func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) 
 	if keyName == "" {
 		return nil
 	}
-	log.Info("puppet [%d]: keypress key='%s' code='%s'", puppet.Id, keyName, pi.Code)
+	log.Info("puppet [%d]: keypress key='%s' code='%s' cssPath='%s'", puppet.Id, keyName, pi.Code, pi.CSSPath)
+
+	// Ensure the correct element has focus before dispatching key events.
+	// The client sends the CSS path of the focused element with every keypress.
+	if pi.CSSPath != "" {
+		ensureFocus(puppet.ctx, puppet.ctx, pi.CSSPath)
+	}
 
 	switch keyName {
 	case "CtrlBackspace":
@@ -667,37 +714,28 @@ func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) 
 	default:
 		return chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 			if len(keyName) == 1 {
-				// Printable character — dispatch KeyDown → InsertText → KeyUp.
-				// This mirrors EvilPuppetJS's approach: keyboard.press() primary,
-				// keyboard.sendCharacter() fallback. We combine both:
-				// - KeyDown fires the keydown event (sites like Microsoft listen for it)
-				// - InsertText fires beforeinput + input events (React needs these)
-				// - KeyUp fires the keyup event for completeness
-				// If InsertText fails, we fallback to KeyChar (like EvilPuppetJS's
-				// sendCharacter fallback for non-standard keyboard layouts).
+				// Printable character — matches Puppeteer's keyboard.press() exactly:
+				// 1. KeyDown with text: Chrome processes this as keydown → keypress →
+				//    text insertion → input. The 'text' field is what triggers actual
+				//    character insertion. This is the native Chrome text input path.
+				// 2. KeyUp: fires the keyup event for completeness.
+				// NO InsertText in primary flow — that was causing potential double
+				// insertion which React/controlled inputs can reject.
 				code, vk := charToCodeAndVK(keyName)
 
-				if err := input.DispatchKeyEvent(input.KeyDown).
+				err := input.DispatchKeyEvent(input.KeyDown).
 					WithKey(keyName).
 					WithCode(code).
 					WithText(keyName).
 					WithUnmodifiedText(keyName).
 					WithWindowsVirtualKeyCode(vk).
 					WithNativeVirtualKeyCode(vk).
-					Do(ctx); err != nil {
-					return err
-				}
+					Do(ctx)
 
-				if err := input.InsertText(keyName).Do(ctx); err != nil {
-					// Fallback: try KeyChar (like EvilPuppetJS's sendCharacter fallback)
-					log.Warning("puppet: InsertText failed for '%s', falling back to KeyChar: %v", keyName, err)
-					if err2 := input.DispatchKeyEvent(input.KeyChar).
-						WithKey(keyName).
-						WithText(keyName).
-						WithUnmodifiedText(keyName).
-						WithWindowsVirtualKeyCode(vk).
-						WithNativeVirtualKeyCode(vk).
-						Do(ctx); err2 != nil {
+				if err != nil {
+					// Fallback: use InsertText (like EvilPuppetJS's sendCharacter fallback)
+					log.Warning("puppet [%d]: KeyDown failed for '%s': %v — trying InsertText", puppet.Id, keyName, err)
+					if err2 := input.InsertText(keyName).Do(ctx); err2 != nil {
 						return err2
 					}
 				}
@@ -736,21 +774,27 @@ func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) 
 }
 
 func (pm *PuppetManager) handleType(puppet *PuppetInstance, pi PuppetInput) error {
-	log.Info("puppet [%d]: type text='%s' (%d chars)", puppet.Id, pi.Text, len(pi.Text))
-	// For pasted text, use InsertText directly for the entire string.
-	// This is equivalent to Puppeteer's page.keyboard.insertText() and is the
-	// most reliable way to insert text into React controlled inputs.
-	// If InsertText fails, fall back to typing character by character (like
-	// EvilPuppetJS's sendCharacter fallback pattern).
+	log.Info("puppet [%d]: type text='%s' (%d chars) cssPath='%s'", puppet.Id, pi.Text, len(pi.Text), pi.CSSPath)
+
+	// Ensure the correct element has focus before pasting
+	if pi.CSSPath != "" {
+		ensureFocus(puppet.ctx, puppet.ctx, pi.CSSPath)
+	}
+
 	return chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		// For pasted text, use InsertText (equivalent to Puppeteer's keyboard.insertText).
+		// If that fails, fall back to character-by-character KeyDown dispatch.
 		if err := input.InsertText(pi.Text).Do(ctx); err != nil {
 			log.Warning("puppet [%d]: InsertText failed for paste, falling back to char-by-char: %v", puppet.Id, err)
 			for _, ch := range pi.Text {
 				s := string(ch)
-				if err2 := input.DispatchKeyEvent(input.KeyChar).
-					WithKey(s).WithText(s).WithUnmodifiedText(s).Do(ctx); err2 != nil {
-					return err2
-				}
+				code, vk := charToCodeAndVK(s)
+				input.DispatchKeyEvent(input.KeyDown).
+					WithKey(s).WithCode(code).WithText(s).WithUnmodifiedText(s).
+					WithWindowsVirtualKeyCode(vk).WithNativeVirtualKeyCode(vk).Do(ctx)
+				input.DispatchKeyEvent(input.KeyUp).
+					WithKey(s).WithCode(code).
+					WithWindowsVirtualKeyCode(vk).WithNativeVirtualKeyCode(vk).Do(ctx)
 			}
 		}
 		return nil

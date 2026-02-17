@@ -756,7 +756,12 @@ body {
         iframeDoc.addEventListener('paste', function(e) {
             var text = (e.clipboardData || window.clipboardData).getData('text');
             if (text) {
-                sendInput({type: 'type', text: text});
+                var focused = iframeDoc.activeElement;
+                var msg = {type: 'type', text: text};
+                if (focused && focused !== iframeDoc && focused !== iframeDoc.body) {
+                    msg.cssPath = getCssPath(focused);
+                }
+                sendInput(msg);
             }
             e.preventDefault();
         });
@@ -869,6 +874,14 @@ body {
             if (e.shiftKey) mod |= 8;
             if (mod) msg.modifiers = mod;
         }
+        // Include CSS path of the focused element so the server can ensure
+        // the correct element has focus in the puppet browser before typing.
+        // This matches EvilPuppetJS's approach of sending cssPath with every keypress.
+        var focused = e.target;
+        if (!focused && iframeDoc) focused = iframeDoc.activeElement;
+        if (focused && focused !== iframeDoc && focused !== iframeDoc.body) {
+            msg.cssPath = getCssPath(focused);
+        }
         return msg;
     }
     function handleKeyDown(e) {
@@ -883,7 +896,17 @@ body {
     document.addEventListener('paste', function(e) {
         if (document.activeElement === urlBar) return;
         var text = (e.clipboardData || window.clipboardData).getData('text');
-        if (text) sendInput({type: 'type', text: text});
+        if (text) {
+            var msg = {type: 'type', text: text};
+            // Try to find focused element in iframe for cssPath
+            if (iframeDoc) {
+                var focused = iframeDoc.activeElement;
+                if (focused && focused !== iframeDoc && focused !== iframeDoc.body) {
+                    msg.cssPath = getCssPath(focused);
+                }
+            }
+            sendInput(msg);
+        }
         e.preventDefault();
     });
 
