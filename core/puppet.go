@@ -526,16 +526,32 @@ func (pm *PuppetManager) HandleInput(puppetId int, pi PuppetInput) error {
 // so the coordinates from the client map 1:1 to the puppet's viewport.
 // This is the same approach as page.mouse.click(x, y) in Puppeteer.
 func (pm *PuppetManager) handleClick(puppet *PuppetInstance, pi PuppetInput) error {
-	log.Info("puppet [%d]: click at (%.0f, %.0f)", puppet.Id, pi.X, pi.Y)
+	// Primary strategy: CSS selector click (like EvilPuppetJS).
+	// The client sends getCssPath(e.target) which identifies the exact element.
+	// We use chromedp.Click with ByQuery which scrolls to the element and clicks
+	// its center using CDP mouse events — equivalent to Puppeteer's element.click().
+	if pi.CSSPath != "" {
+		log.Info("puppet [%d]: CSS click on '%s'", puppet.Id, pi.CSSPath)
+		ctx, cancel := context.WithTimeout(puppet.ctx, 3*time.Second)
+		defer cancel()
+		err := chromedp.Run(ctx, chromedp.Click(pi.CSSPath, chromedp.ByQuery))
+		if err == nil {
+			return nil
+		}
+		log.Warning("puppet [%d]: CSS click failed (%v), falling back to coordinates (%.0f, %.0f)", puppet.Id, err, pi.X, pi.Y)
+	}
 
+	// Fallback strategy: coordinate-based click using CDP mouse events.
+	if pi.X == 0 && pi.Y == 0 {
+		return fmt.Errorf("no CSS path and no coordinates for click")
+	}
+	log.Info("puppet [%d]: coordinate click at (%.0f, %.0f)", puppet.Id, pi.X, pi.Y)
 	return chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		// Move mouse to position (some sites track mousemove for hover states)
 		if err := input.DispatchMouseEvent(input.MouseMoved, pi.X, pi.Y).Do(ctx); err != nil {
 			return err
 		}
 		time.Sleep(50 * time.Millisecond)
 
-		// Press
 		if err := input.DispatchMouseEvent(input.MousePressed, pi.X, pi.Y).
 			WithButton(input.Left).
 			WithClickCount(1).
@@ -544,7 +560,6 @@ func (pm *PuppetManager) handleClick(puppet *PuppetInstance, pi PuppetInput) err
 		}
 		time.Sleep(30 * time.Millisecond)
 
-		// Release
 		return input.DispatchMouseEvent(input.MouseReleased, pi.X, pi.Y).
 			WithButton(input.Left).
 			WithClickCount(1).
@@ -590,8 +605,33 @@ func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) 
 	default:
 		return chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 			if len(keyName) == 1 {
-				// Printable character — use KeyChar for reliable input
-				return input.DispatchKeyEvent(input.KeyChar).WithText(keyName).Do(ctx)
+				// Printable character — dispatch full KeyDown → Char → KeyUp sequence.
+				// This matches Puppeteer's keyboard.press() behavior. Just sending KeyChar
+				// alone doesn't work because SPAs (Microsoft login, etc.) listen for
+				// keydown events to validate input and manage focus.
+				code, vk := charToCodeAndVK(keyName)
+				text := keyName
+
+				evtDown := input.DispatchKeyEvent(input.KeyDown).
+					WithKey(keyName).
+					WithCode(code).
+					WithText(text).
+					WithWindowsVirtualKeyCode(vk).
+					WithNativeVirtualKeyCode(vk)
+				if err := evtDown.Do(ctx); err != nil {
+					return err
+				}
+
+				if err := input.DispatchKeyEvent(input.KeyChar).WithText(text).Do(ctx); err != nil {
+					return err
+				}
+
+				return input.DispatchKeyEvent(input.KeyUp).
+					WithKey(keyName).
+					WithCode(code).
+					WithWindowsVirtualKeyCode(vk).
+					WithNativeVirtualKeyCode(vk).
+					Do(ctx)
 			}
 			// Special key — dispatch KeyDown then KeyUp with modifiers
 			evtDown := input.DispatchKeyEvent(input.KeyDown).WithKey(keyName)
@@ -621,10 +661,32 @@ func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) 
 
 func (pm *PuppetManager) handleType(puppet *PuppetInstance, pi PuppetInput) error {
 	for _, ch := range pi.Text {
+		charStr := string(ch)
 		err := chromedp.Run(puppet.ctx,
 			chromedp.ActionFunc(func(ctx context.Context) error {
-				return input.DispatchKeyEvent(input.KeyChar).
-					WithText(string(ch)).
+				code, vk := charToCodeAndVK(charStr)
+
+				if err := input.DispatchKeyEvent(input.KeyDown).
+					WithKey(charStr).
+					WithCode(code).
+					WithText(charStr).
+					WithWindowsVirtualKeyCode(vk).
+					WithNativeVirtualKeyCode(vk).
+					Do(ctx); err != nil {
+					return err
+				}
+
+				if err := input.DispatchKeyEvent(input.KeyChar).
+					WithText(charStr).
+					Do(ctx); err != nil {
+					return err
+				}
+
+				return input.DispatchKeyEvent(input.KeyUp).
+					WithKey(charStr).
+					WithCode(code).
+					WithWindowsVirtualKeyCode(vk).
+					WithNativeVirtualKeyCode(vk).
 					Do(ctx)
 			}),
 		)
@@ -1015,6 +1077,69 @@ func keyToVirtualKeyCode(key string) (int64, bool) {
 	}
 	vk, ok := keyMap[key]
 	return vk, ok
+}
+
+// charToCodeAndVK maps a single printable character to its DOM `code` property and
+// Windows virtual key code, matching what Puppeteer's keyboard.press() sends.
+func charToCodeAndVK(ch string) (code string, vk int64) {
+	if len(ch) != 1 {
+		return "", 0
+	}
+	c := ch[0]
+	switch {
+	case c >= 'a' && c <= 'z':
+		return "Key" + string(c-32), int64(c - 32) // 'a'->65, 'z'->90
+	case c >= 'A' && c <= 'Z':
+		return "Key" + string(c), int64(c) // 'A'->65
+	case c >= '0' && c <= '9':
+		return "Digit" + string(c), int64(c) // '0'->48, '9'->57
+	case c == ' ':
+		return "Space", 32
+	case c == '-' || c == '_':
+		return "Minus", 189
+	case c == '=' || c == '+':
+		return "Equal", 187
+	case c == '[' || c == '{':
+		return "BracketLeft", 219
+	case c == ']' || c == '}':
+		return "BracketRight", 221
+	case c == '\\' || c == '|':
+		return "Backslash", 220
+	case c == ';' || c == ':':
+		return "Semicolon", 186
+	case c == '\'' || c == '"':
+		return "Quote", 222
+	case c == ',' || c == '<':
+		return "Comma", 188
+	case c == '.' || c == '>':
+		return "Period", 190
+	case c == '/' || c == '?':
+		return "Slash", 191
+	case c == '`' || c == '~':
+		return "Backquote", 192
+	case c == '!':
+		return "Digit1", 49
+	case c == '@':
+		return "Digit2", 50
+	case c == '#':
+		return "Digit3", 51
+	case c == '$':
+		return "Digit4", 52
+	case c == '%':
+		return "Digit5", 53
+	case c == '^':
+		return "Digit6", 54
+	case c == '&':
+		return "Digit7", 55
+	case c == '*':
+		return "Digit8", 56
+	case c == '(':
+		return "Digit9", 57
+	case c == ')':
+		return "Digit0", 48
+	default:
+		return "", int64(c)
+	}
 }
 
 // extractDOMScript is the JavaScript evaluated in the puppet browser to extract the page DOM.
