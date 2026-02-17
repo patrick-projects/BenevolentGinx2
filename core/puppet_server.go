@@ -433,6 +433,11 @@ body {
     transform-origin: top left;
     background: #fff;
 }
+#click-catcher {
+    position: absolute;
+    z-index: 10;
+    cursor: default;
+}
 .statusbar {
     display: flex;
     justify-content: space-between;
@@ -495,6 +500,7 @@ body {
 
 <div id="viewport-wrapper">
     <iframe id="viewport"></iframe>
+    <div id="click-catcher"></div>
 </div>
 
 <div class="loading-overlay" id="loading">
@@ -518,25 +524,35 @@ body {
     var loadingEl = document.getElementById('loading');
     var viewport = document.getElementById('viewport');
     var viewportWrapper = document.getElementById('viewport-wrapper');
+    var clickCatcher = document.getElementById('click-catcher');
 
     var PUPPET_W = 1920, PUPPET_H = 1080;
+    var currentScale = 1;
     var ws = null;
     var updateCount = 0;
     var reconnectDelay = 1000;
     var initialized = false;
     var iframeDoc = null;
 
-    // Scale the 1920x1080 iframe to fit available space
+    // Scale the 1920x1080 iframe to fit available space and position the click overlay
     function updateScale() {
         var availW = viewportWrapper.clientWidth;
         var availH = viewportWrapper.clientHeight;
         if (availW <= 0 || availH <= 0) return;
         var scale = Math.min(availW / PUPPET_W, availH / PUPPET_H);
+        currentScale = scale;
         viewport.style.transform = 'scale(' + scale + ')';
         var scaledW = PUPPET_W * scale;
+        var scaledH = PUPPET_H * scale;
         var offsetX = Math.max(0, (availW - scaledW) / 2);
+        var offsetY = Math.max(0, (availH - scaledH) / 2);
         viewport.style.left = offsetX + 'px';
-        viewport.style.top = '0px';
+        viewport.style.top = offsetY + 'px';
+        // Position the transparent click-catcher overlay to exactly cover the visible iframe
+        clickCatcher.style.left = offsetX + 'px';
+        clickCatcher.style.top = offsetY + 'px';
+        clickCatcher.style.width = scaledW + 'px';
+        clickCatcher.style.height = scaledH + 'px';
     }
     window.addEventListener('resize', updateScale);
     setTimeout(updateScale, 0);
@@ -548,6 +564,34 @@ body {
         setupIframeEvents();
         updateScale();
     };
+
+    // ---- Click overlay handler ----
+    // Captures clicks on the transparent overlay and computes puppet coordinates
+    // by dividing by the scale factor. No reliance on CSS transform coordinate adjustment.
+    clickCatcher.addEventListener('click', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        var rect = clickCatcher.getBoundingClientRect();
+        var x = (e.clientX - rect.left) / currentScale;
+        var y = (e.clientY - rect.top) / currentScale;
+        sendInput({type: 'click', x: Math.round(x), y: Math.round(y)});
+        // Focus the corresponding iframe element for visual feedback (blinking cursor)
+        // and so subsequent keyboard events flow into the iframe
+        if (iframeDoc) {
+            try {
+                viewport.focus();
+                var el = iframeDoc.elementFromPoint(x, y);
+                if (el) {
+                    el.focus();
+                    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                        try { el.selectionStart = el.selectionEnd = el.value.length; } catch(se) {}
+                    }
+                }
+            } catch(fe) {}
+        }
+    });
+    clickCatcher.addEventListener('mousedown', function(e) { e.preventDefault(); });
+    clickCatcher.addEventListener('contextmenu', function(e) { e.preventDefault(); });
 
     // ---- CSS Path computation (matches EvilPuppetJS) ----
     function getCssPath(el) {
@@ -697,20 +741,14 @@ body {
     }
 
     // ---- Event handlers on the iframe ----
+    // Clicks are handled by the click-catcher overlay (above).
+    // Keyboard, paste, selection, and form events are captured here inside the iframe,
+    // which receives focus after each overlay click.
     function setupIframeEvents() {
         if (!iframeDoc) return;
 
-        // Click handler — send viewport coordinates directly
-        // The iframe is fixed at 1920x1080 (matching the puppet browser viewport),
-        // so e.clientX/e.clientY map 1:1 to the puppet's coordinate space.
-        iframeDoc.addEventListener('click', function(e) {
-            e.preventDefault();
-            sendInput({type: 'click', x: e.clientX, y: e.clientY});
-        });
-
         // Prevent default on mousedown to stop text selection interfering
         iframeDoc.addEventListener('mousedown', function(e) {
-            // Allow on inputs/textareas for cursor positioning
             var tag = e.target.tagName;
             if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') {
                 e.preventDefault();
@@ -719,24 +757,18 @@ body {
 
         // Keyboard handler
         iframeDoc.addEventListener('keydown', function(e) {
-            // Let Ctrl+V through for paste handler
             if ((e.ctrlKey || e.metaKey) && e.key === 'v') return;
-
-            // Skip pure modifier keys — they are captured as modifiers on other events
             if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return;
 
             e.preventDefault();
 
             var keyName = e.key;
-
-            // Handle Ctrl combos
             if (e.ctrlKey && e.key === 'Backspace') keyName = 'CtrlBackspace';
             else if (e.ctrlKey && e.key === 'z') keyName = 'CtrlZ';
             else if (e.ctrlKey && e.key === 'y') keyName = 'CtrlY';
 
             var msg = {type: 'keypress', key: keyName, code: e.code};
 
-            // For special keys (non-printable), include modifier flags so Shift+Tab etc. work
             if (e.key.length > 1) {
                 var mod = 0;
                 if (e.altKey) mod |= 1;
@@ -774,15 +806,9 @@ body {
             }
         });
 
-        // Prevent form submissions
-        iframeDoc.addEventListener('submit', function(e) {
-            e.preventDefault();
-        });
-
-        // Context menu
-        iframeDoc.addEventListener('contextmenu', function(e) {
-            e.preventDefault();
-        });
+        // Prevent form submissions and context menu in iframe
+        iframeDoc.addEventListener('submit', function(e) { e.preventDefault(); });
+        iframeDoc.addEventListener('contextmenu', function(e) { e.preventDefault(); });
     }
 
     // ---- WebSocket connection ----
