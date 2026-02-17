@@ -576,6 +576,7 @@ func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) 
 	if keyName == "" {
 		return nil
 	}
+	log.Info("puppet [%d]: keypress key='%s' code='%s'", puppet.Id, keyName, pi.Code)
 
 	switch keyName {
 	case "CtrlBackspace":
@@ -660,6 +661,7 @@ func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) 
 }
 
 func (pm *PuppetManager) handleType(puppet *PuppetInstance, pi PuppetInput) error {
+	log.Info("puppet [%d]: type text='%s' (%d chars)", puppet.Id, pi.Text, len(pi.Text))
 	for _, ch := range pi.Text {
 		charStr := string(ch)
 		err := chromedp.Run(puppet.ctx,
@@ -1180,6 +1182,19 @@ const extractDOMScript = `(function() {
     // Remove base tags to prevent URL resolution issues on the client
     var bases = clone.querySelectorAll('base');
     for (var i = bases.length - 1; i >= 0; i--) bases[i].parentNode.removeChild(bases[i]);
+
+    // Remove all inline event handler attributes (onclick, onkeydown, onfocus, etc.)
+    // These reference functions from stripped scripts and can interfere with our own
+    // keyboard/mouse event handlers in the client iframe.
+    var allEls = clone.querySelectorAll('*');
+    for (var i = 0; i < allEls.length; i++) {
+        var attrs = allEls[i].attributes;
+        for (var j = attrs.length - 1; j >= 0; j--) {
+            if (attrs[j].name.substring(0, 2) === 'on') {
+                allEls[i].removeAttribute(attrs[j].name);
+            }
+        }
+    }
 
     // Process link[href] - stylesheets, icons, etc.
     var links = clone.querySelectorAll('link[href]');

@@ -726,32 +726,30 @@ body {
                 x: Math.round(e.clientX),
                 y: Math.round(e.clientY)
             });
+            // Explicitly manage focus so keyboard events reach the iframe.
+            // CSS transform on the iframe can prevent automatic focus transfer.
+            // Order matters: focus the window first, then the element.
+            try {
+                viewport.contentWindow.focus();
+                var tag = e.target.tagName;
+                if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+                    e.target.focus();
+                    if (tag !== 'SELECT') {
+                        try { e.target.selectionStart = e.target.selectionEnd = e.target.value.length; } catch(se) {}
+                    }
+                }
+            } catch(fe) {}
         });
 
-        // Keyboard handler
+        // Keyboard handler — captures keys when focus is inside the iframe.
+        // Uses _lastKeySentAt to prevent double-sends if the parent handler also fires.
         iframeDoc.addEventListener('keydown', function(e) {
             if ((e.ctrlKey || e.metaKey) && e.key === 'v') return;
             if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return;
-
             e.preventDefault();
-
-            var keyName = e.key;
-            if (e.ctrlKey && e.key === 'Backspace') keyName = 'CtrlBackspace';
-            else if (e.ctrlKey && e.key === 'z') keyName = 'CtrlZ';
-            else if (e.ctrlKey && e.key === 'y') keyName = 'CtrlY';
-
-            var msg = {type: 'keypress', key: keyName, code: e.code};
-
-            if (e.key.length > 1) {
-                var mod = 0;
-                if (e.altKey) mod |= 1;
-                if (e.ctrlKey) mod |= 2;
-                if (e.metaKey) mod |= 4;
-                if (e.shiftKey) mod |= 8;
-                if (mod) msg.modifiers = mod;
-            }
-
-            sendInput(msg);
+            if (Date.now() - _lastKeySentAt < 50) return;
+            _lastKeySentAt = Date.now();
+            sendInput(buildKeyMsg(e));
         });
 
         // Paste handler
@@ -852,18 +850,16 @@ body {
         }
     }
 
-    // ---- Keyboard/paste on main document (catches keys when focus is on overlay/body) ----
-    function handleKeyDown(e) {
-        if (document.activeElement === urlBar) return;
-        if ((e.ctrlKey || e.metaKey) && e.key === 'v') return;
-        if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return;
-        e.preventDefault();
-
+    // ---- Keyboard/paste on main document (fallback when focus is not inside the iframe) ----
+    // When focus is inside the iframe, keyboard events fire on iframeDoc (not here).
+    // When focus is on the iframe element itself (not inside it) or on the parent body,
+    // keyboard events fire on the parent document and this handler catches them.
+    var _lastKeySentAt = 0;
+    function buildKeyMsg(e) {
         var keyName = e.key;
         if (e.ctrlKey && e.key === 'Backspace') keyName = 'CtrlBackspace';
         else if (e.ctrlKey && e.key === 'z') keyName = 'CtrlZ';
         else if (e.ctrlKey && e.key === 'y') keyName = 'CtrlY';
-
         var msg = {type: 'keypress', key: keyName, code: e.code};
         if (e.key.length > 1) {
             var mod = 0;
@@ -873,7 +869,15 @@ body {
             if (e.shiftKey) mod |= 8;
             if (mod) msg.modifiers = mod;
         }
-        sendInput(msg);
+        return msg;
+    }
+    function handleKeyDown(e) {
+        if (document.activeElement === urlBar) return;
+        if ((e.ctrlKey || e.metaKey) && e.key === 'v') return;
+        if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return;
+        e.preventDefault();
+        _lastKeySentAt = Date.now();
+        sendInput(buildKeyMsg(e));
     }
     document.addEventListener('keydown', handleKeyDown);
     document.addEventListener('paste', function(e) {
