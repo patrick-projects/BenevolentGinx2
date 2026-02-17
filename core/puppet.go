@@ -960,8 +960,8 @@ func StealthChromeOpts(userAgent string, viewportW, viewportH int) []chromedp.Ex
 		// Stealth flags — remove automation markers
 		chromedp.Flag("enable-automation", false),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.Flag("excludeSwitches", "enable-automation"),
-		chromedp.Flag("disable-features", "TranslateUI,VizDisplayCompositor"),
+		// Merge default + stealth disable-features (chromedp defaults override, so include both)
+		chromedp.Flag("disable-features", "site-per-process,Translate,BlinkGenPropertyTrees,TranslateUI,VizDisplayCompositor"),
 		chromedp.Flag("disable-infobars", true),
 		chromedp.Flag("disable-extensions", true),
 	)
@@ -972,19 +972,61 @@ func StealthChromeOpts(userAgent string, viewportW, viewportH int) []chromedp.Ex
 // This is the Go equivalent of puppeteer-extra-plugin-stealth used by EvilPuppetJS.
 // Must be called after browser context is created but before navigating to the target.
 func InjectStealthScripts(ctx context.Context, userAgent string) {
-	// Set user-agent override via CDP (more thorough than command-line flag)
-	platform := "Win32"
+	// Parse platform from UA
+	jsPlatform := "Win32" // navigator.platform
+	chPlatform := "Windows"
+	chPlatformVer := "15.0.0"
+	arch := "x86"
 	if strings.Contains(userAgent, "Macintosh") {
-		platform = "MacIntel"
+		jsPlatform = "MacIntel"
+		chPlatform = "macOS"
+		chPlatformVer = "14.0.0"
+		arch = "arm"
 	} else if strings.Contains(userAgent, "Linux") {
-		platform = "Linux x86_64"
+		jsPlatform = "Linux x86_64"
+		chPlatform = "Linux"
+		chPlatformVer = "6.5.0"
+		arch = "x86"
+	}
+
+	// Parse Chrome version from UA for Client Hints brands
+	chromeMajor := "120"
+	chromeFullVer := "120.0.0.0"
+	if idx := strings.Index(userAgent, "Chrome/"); idx != -1 {
+		ver := userAgent[idx+7:]
+		if sp := strings.IndexAny(ver, " ;)"); sp != -1 {
+			ver = ver[:sp]
+		}
+		chromeFullVer = ver
+		if dot := strings.Index(ver, "."); dot != -1 {
+			chromeMajor = ver[:dot]
+		}
 	}
 
 	chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		// CDP-level user agent override — sets navigator.userAgent, navigator.platform, etc.
+		// CDP-level user agent override with Client Hints metadata.
+		// Without UserAgentMetadata, Sec-CH-UA headers are NOT sent at all,
+		// which is an instant detection signal for sites like Microsoft.
 		if err := emulation.SetUserAgentOverride(userAgent).
-			WithPlatform(platform).
+			WithPlatform(jsPlatform).
 			WithAcceptLanguage("en-US,en;q=0.9").
+			WithUserAgentMetadata(&emulation.UserAgentMetadata{
+				Brands: []*emulation.UserAgentBrandVersion{
+					{Brand: "Chromium", Version: chromeMajor},
+					{Brand: "Google Chrome", Version: chromeMajor},
+					{Brand: "Not_A Brand", Version: "8"},
+				},
+				FullVersionList: []*emulation.UserAgentBrandVersion{
+					{Brand: "Chromium", Version: chromeFullVer},
+					{Brand: "Google Chrome", Version: chromeFullVer},
+					{Brand: "Not_A Brand", Version: "8.0.0.0"},
+				},
+				Platform:        chPlatform,
+				PlatformVersion: chPlatformVer,
+				Architecture:    arch,
+				Model:           "",
+				Mobile:          false,
+			}).
 			Do(ctx); err != nil {
 			return err
 		}
@@ -995,56 +1037,289 @@ func InjectStealthScripts(ctx context.Context, userAgent string) {
 }
 
 // stealthScript is injected into every page in the puppet browser before any site scripts run.
-// It patches the JavaScript environment to remove traces of headless Chrome / automation,
-// equivalent to puppeteer-extra-plugin-stealth's evasions.
-var stealthScript = buildStealthScript()
+// It patches the JavaScript environment to remove traces of headless Chrome / automation.
+// This is a comprehensive evasion equivalent to puppeteer-extra-plugin-stealth, including
+// the critical Function.prototype.toString faker that prevents detection of patched APIs.
+var stealthScript = `(function() {
+    // =========================================================================
+    // 1. FUNCTION TOSTRING FAKER — The #1 bot detection evasion.
+    //    Without this, detectors call .toString() on navigator.permissions.query etc.
+    //    and see our patched source code instead of "function query() { [native code] }".
+    // =========================================================================
+    var _origToString = Function.prototype.toString;
+    var _tsMap = new Map();
+    Function.prototype.toString = new Proxy(_origToString, {
+        apply: function(target, thisArg, args) {
+            var cached = _tsMap.get(thisArg);
+            if (cached) return cached;
+            return Reflect.apply(target, thisArg, args);
+        }
+    });
+    // Make toString itself look native
+    _tsMap.set(Function.prototype.toString, _origToString.call(_origToString));
 
-func buildStealthScript() string {
-	return "(function() {" +
-		// navigator.webdriver
-		"Object.defineProperty(navigator,'webdriver',{get:()=>undefined});" +
-		// window.chrome
-		"if(!window.chrome)window.chrome={};" +
-		"if(!window.chrome.runtime){window.chrome.runtime={onConnect:undefined,onMessage:undefined," +
-		"sendMessage:function(){},connect:function(){return{onMessage:{addListener:function(){}},postMessage:function(){}};}}}" +
-		"window.chrome.csi=function(){return{}};" +
-		"window.chrome.loadTimes=function(){return{}};" +
-		"if(!window.chrome.app){window.chrome.app={isInstalled:false,getDetails:function(){}," +
-		"getIsInstalled:function(){},installState:function(){return'disabled'},runningState:function(){return'cannot_run'}}}" +
-		// navigator.plugins
-		"Object.defineProperty(navigator,'plugins',{get:function(){var a=[" +
-		"{name:'Chrome PDF Plugin',filename:'internal-pdf-viewer',description:'Portable Document Format',length:1}," +
-		"{name:'Chrome PDF Viewer',filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai',description:'',length:1}," +
-		"{name:'Native Client',filename:'internal-nacl-plugin',description:'',length:2}];a.refresh=function(){};return a}});" +
-		// navigator.mimeTypes
-		"Object.defineProperty(navigator,'mimeTypes',{get:function(){return[" +
-		"{type:'application/pdf',suffixes:'pdf',description:'Portable Document Format'}," +
-		"{type:'application/x-google-chrome-pdf',suffixes:'pdf',description:'Portable Document Format'}]}});" +
-		// navigator.languages
-		"Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});" +
-		// navigator.permissions.query
-		"if(navigator.permissions){var oq=navigator.permissions.query.bind(navigator.permissions);" +
-		"navigator.permissions.query=function(p){if(p.name==='notifications')return Promise.resolve({state:Notification.permission});return oq(p)}}" +
-		// navigator.connection
-		"if(!navigator.connection){Object.defineProperty(navigator,'connection',{get:()=>({effectiveType:'4g',rtt:50,downlink:10,saveData:false})})}" +
-		// window outer dimensions
-		"if(window.outerWidth===0)Object.defineProperty(window,'outerWidth',{get:()=>window.innerWidth});" +
-		"if(window.outerHeight===0)Object.defineProperty(window,'outerHeight',{get:()=>window.innerHeight+85});" +
-		// WebGL vendor/renderer (hide SwiftShader)
-		"try{var gp=WebGLRenderingContext.prototype.getParameter;WebGLRenderingContext.prototype.getParameter=function(p){" +
-		"if(p===37445)return'Intel Inc.';if(p===37446)return'Intel Iris OpenGL Engine';return gp.call(this,p)}}catch(e){}" +
-		"try{var gp2=WebGL2RenderingContext.prototype.getParameter;WebGL2RenderingContext.prototype.getParameter=function(p){" +
-		"if(p===37445)return'Intel Inc.';if(p===37446)return'Intel Iris OpenGL Engine';return gp2.call(this,p)}}catch(e){}" +
-		// Remove CDP markers
-		"try{var ks=Object.keys(window);for(var i=0;i<ks.length;i++){if(/^(cdc_|__cdc_)/.test(ks[i])){try{delete window[ks[i]]}catch(e){}}}}catch(e){}" +
-		// Notification
-		"if(typeof Notification==='undefined')window.Notification={permission:'default'};" +
-		// navigator.hardwareConcurrency
-		"if(navigator.hardwareConcurrency<2)Object.defineProperty(navigator,'hardwareConcurrency',{get:()=>4});" +
-		// navigator.deviceMemory
-		"if(!navigator.deviceMemory||navigator.deviceMemory<4)Object.defineProperty(navigator,'deviceMemory',{get:()=>8});" +
-		"})()"
-}
+    // Helper: patch a function and register it with the toString faker
+    function patchFn(obj, prop, fn) {
+        try {
+            var orig = obj[prop];
+            obj[prop] = fn;
+            if (orig) _tsMap.set(fn, _origToString.call(orig));
+        } catch(e) {}
+    }
+
+    // Helper: patch a getter on a prototype and register with toString faker
+    function patchGetter(proto, prop, getter) {
+        try {
+            var origDesc = Object.getOwnPropertyDescriptor(proto, prop);
+            var origGet = origDesc && origDesc.get;
+            Object.defineProperty(proto, prop, {
+                get: getter, configurable: true, enumerable: true
+            });
+            if (origGet) _tsMap.set(getter, _origToString.call(origGet));
+        } catch(e) {}
+    }
+
+    // =========================================================================
+    // 2. NAVIGATOR PATCHES
+    // =========================================================================
+
+    // navigator.webdriver — must be undefined (headless sets it to true)
+    patchGetter(Navigator.prototype, 'webdriver', function() { return undefined; });
+
+    // navigator.vendor — must be "Google Inc." (headless sometimes has empty string)
+    patchGetter(Navigator.prototype, 'vendor', function() { return 'Google Inc.'; });
+
+    // navigator.languages
+    patchGetter(Navigator.prototype, 'languages', function() { return ['en-US', 'en']; });
+
+    // navigator.hardwareConcurrency — VPS often reports 1, real machines have 4+
+    if (navigator.hardwareConcurrency < 2) {
+        patchGetter(Navigator.prototype, 'hardwareConcurrency', function() { return 4; });
+    }
+
+    // navigator.deviceMemory
+    if (!navigator.deviceMemory || navigator.deviceMemory < 4) {
+        patchGetter(Navigator.prototype, 'deviceMemory', function() { return 8; });
+    }
+
+    // navigator.plugins — must look like a real PluginArray with actual Plugin objects.
+    // Detectors check: length > 0, toString returns [object PluginArray], item() method.
+    (function() {
+        var plugins = [
+            {name:'Chrome PDF Plugin', filename:'internal-pdf-viewer', description:'Portable Document Format'},
+            {name:'Chrome PDF Viewer', filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai', description:''},
+            {name:'Native Client', filename:'internal-nacl-plugin', description:''}
+        ];
+        var pluginArr = Object.create(PluginArray.prototype);
+        for (var i = 0; i < plugins.length; i++) {
+            var p = Object.create(Plugin.prototype);
+            Object.defineProperties(p, {
+                name: {value: plugins[i].name, enumerable: true},
+                filename: {value: plugins[i].filename, enumerable: true},
+                description: {value: plugins[i].description, enumerable: true},
+                length: {value: 1, enumerable: true}
+            });
+            pluginArr[i] = p;
+        }
+        Object.defineProperty(pluginArr, 'length', {value: plugins.length, enumerable: true});
+        pluginArr.item = function(idx) { return this[idx] || null; };
+        _tsMap.set(pluginArr.item, 'function item() { [native code] }');
+        pluginArr.namedItem = function(name) {
+            for (var i = 0; i < this.length; i++) { if (this[i].name === name) return this[i]; }
+            return null;
+        };
+        _tsMap.set(pluginArr.namedItem, 'function namedItem() { [native code] }');
+        pluginArr.refresh = function() {};
+        _tsMap.set(pluginArr.refresh, 'function refresh() { [native code] }');
+
+        patchGetter(Navigator.prototype, 'plugins', function() { return pluginArr; });
+    })();
+
+    // navigator.mimeTypes
+    (function() {
+        var mimes = [
+            {type:'application/pdf', suffixes:'pdf', description:'Portable Document Format'},
+            {type:'application/x-google-chrome-pdf', suffixes:'pdf', description:'Portable Document Format'}
+        ];
+        var mimeArr = Object.create(MimeTypeArray.prototype);
+        for (var i = 0; i < mimes.length; i++) {
+            var m = Object.create(MimeType.prototype);
+            Object.defineProperties(m, {
+                type: {value: mimes[i].type, enumerable: true},
+                suffixes: {value: mimes[i].suffixes, enumerable: true},
+                description: {value: mimes[i].description, enumerable: true}
+            });
+            mimeArr[i] = m;
+        }
+        Object.defineProperty(mimeArr, 'length', {value: mimes.length, enumerable: true});
+        mimeArr.item = function(idx) { return this[idx] || null; };
+        _tsMap.set(mimeArr.item, 'function item() { [native code] }');
+        mimeArr.namedItem = function(name) {
+            for (var i = 0; i < this.length; i++) { if (this[i].type === name) return this[i]; }
+            return null;
+        };
+        _tsMap.set(mimeArr.namedItem, 'function namedItem() { [native code] }');
+
+        patchGetter(Navigator.prototype, 'mimeTypes', function() { return mimeArr; });
+    })();
+
+    // navigator.permissions.query — must handle 'notifications' without prompting
+    if (navigator.permissions) {
+        var origQuery = navigator.permissions.query.bind(navigator.permissions);
+        patchFn(navigator.permissions, 'query', function(params) {
+            if (params && params.name === 'notifications') {
+                return Promise.resolve({state: Notification.permission || 'default', onchange: null});
+            }
+            return origQuery(params);
+        });
+    }
+
+    // navigator.connection
+    if (!navigator.connection) {
+        Object.defineProperty(navigator, 'connection', {
+            get: function() { return {effectiveType:'4g', rtt:50, downlink:10, saveData:false, onchange:null}; },
+            configurable: true, enumerable: true
+        });
+    }
+
+    // navigator.mediaDevices.enumerateDevices — headless returns empty array
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+        var origEnum = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+        patchFn(navigator.mediaDevices, 'enumerateDevices', function() {
+            return origEnum().then(function(devices) {
+                if (devices.length > 0) return devices;
+                return [
+                    {deviceId:'default', kind:'audioinput', label:'', groupId:'default'},
+                    {deviceId:'default', kind:'audiooutput', label:'', groupId:'default'},
+                    {deviceId:'default', kind:'videoinput', label:'', groupId:'default'}
+                ];
+            });
+        });
+    }
+
+    // =========================================================================
+    // 3. WINDOW / CHROME OBJECT
+    // =========================================================================
+
+    if (!window.chrome) window.chrome = {};
+    if (!window.chrome.runtime) {
+        window.chrome.runtime = {
+            onConnect: undefined, onMessage: undefined,
+            sendMessage: function() {},
+            connect: function() { return {onMessage:{addListener:function(){}}, postMessage:function(){}}; }
+        };
+        _tsMap.set(window.chrome.runtime.sendMessage, 'function sendMessage() { [native code] }');
+        _tsMap.set(window.chrome.runtime.connect, 'function connect() { [native code] }');
+    }
+    if (!window.chrome.csi) { window.chrome.csi = function() { return {}; }; }
+    if (!window.chrome.loadTimes) { window.chrome.loadTimes = function() { return {}; }; }
+    if (!window.chrome.app) {
+        window.chrome.app = {
+            isInstalled: false, getDetails: function() {},
+            getIsInstalled: function() {},
+            installState: function() { return 'disabled'; },
+            runningState: function() { return 'cannot_run'; }
+        };
+    }
+
+    // =========================================================================
+    // 4. SCREEN / WINDOW PROPERTIES
+    // =========================================================================
+
+    // screen.colorDepth / pixelDepth — headless may report 0
+    if (screen.colorDepth === 0 || screen.colorDepth === undefined) {
+        Object.defineProperty(screen, 'colorDepth', {get: function() { return 24; }});
+    }
+    if (screen.pixelDepth === 0 || screen.pixelDepth === undefined) {
+        Object.defineProperty(screen, 'pixelDepth', {get: function() { return 24; }});
+    }
+
+    // window.outerWidth/outerHeight — 0 in headless
+    if (window.outerWidth === 0) {
+        Object.defineProperty(window, 'outerWidth', {get: function() { return window.innerWidth; }});
+    }
+    if (window.outerHeight === 0) {
+        Object.defineProperty(window, 'outerHeight', {get: function() { return window.innerHeight + 85; }});
+    }
+
+    // Notification API
+    if (typeof Notification === 'undefined') {
+        window.Notification = {permission: 'default'};
+    }
+
+    // =========================================================================
+    // 5. WEBGL — hide SwiftShader (headless GPU renderer)
+    // =========================================================================
+    try {
+        var wglProto = WebGLRenderingContext.prototype;
+        var origGetParam = wglProto.getParameter;
+        wglProto.getParameter = function(param) {
+            if (param === 37445) return 'Intel Inc.';
+            if (param === 37446) return 'Intel Iris OpenGL Engine';
+            return origGetParam.call(this, param);
+        };
+        _tsMap.set(wglProto.getParameter, _origToString.call(origGetParam));
+    } catch(e) {}
+    try {
+        var wgl2Proto = WebGL2RenderingContext.prototype;
+        var origGetParam2 = wgl2Proto.getParameter;
+        wgl2Proto.getParameter = function(param) {
+            if (param === 37445) return 'Intel Inc.';
+            if (param === 37446) return 'Intel Iris OpenGL Engine';
+            return origGetParam2.call(this, param);
+        };
+        _tsMap.set(wgl2Proto.getParameter, _origToString.call(origGetParam2));
+    } catch(e) {}
+
+    // =========================================================================
+    // 6. CDP / AUTOMATION MARKERS
+    // =========================================================================
+
+    // Remove cdc_ (ChromeDriver) and __cdc_ markers
+    try {
+        Object.keys(window).forEach(function(key) {
+            if (/^(cdc_|__cdc_|__driver_|__webdriver_|calledSelenium|_phantom|__nightmare)/.test(key)) {
+                try { delete window[key]; } catch(e) {}
+            }
+        });
+    } catch(e) {}
+
+    // Remove Permissions.prototype.query enumeration artifacts
+    // (some detectors check if query was overridden by checking descriptor)
+    try {
+        var permDesc = Object.getOwnPropertyDescriptor(Permissions.prototype, 'query');
+        if (permDesc && permDesc.writable) {
+            Object.defineProperty(Permissions.prototype, 'query', {
+                value: Permissions.prototype.query,
+                writable: true, configurable: true
+            });
+        }
+    } catch(e) {}
+
+    // =========================================================================
+    // 7. IFRAME CONSISTENCY
+    //    AddScriptToEvaluateOnNewDocument runs in all frames automatically,
+    //    but some detectors create fresh iframes and check properties there.
+    //    This observer patches new iframes as they appear.
+    // =========================================================================
+    try {
+        var iframeObserver = new MutationObserver(function(mutations) {
+            mutations.forEach(function(mutation) {
+                mutation.addedNodes.forEach(function(node) {
+                    if (node.tagName === 'IFRAME' && node.contentWindow) {
+                        try {
+                            Object.defineProperty(node.contentWindow.navigator, 'webdriver', {
+                                get: function() { return undefined; }
+                            });
+                        } catch(e) {}
+                    }
+                });
+            });
+        });
+        iframeObserver.observe(document.documentElement, {childList: true, subtree: true});
+    } catch(e) {}
+
+})();`
 
 // keyToVirtualKeyCode maps JavaScript key names to Windows virtual key codes.
 func keyToVirtualKeyCode(key string) (int64, bool) {
