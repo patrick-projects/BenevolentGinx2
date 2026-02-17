@@ -522,19 +522,48 @@ func (pm *PuppetManager) HandleInput(puppetId int, pi PuppetInput) error {
 }
 
 // handleCSSClick clicks an element in the puppet browser identified by its CSS selector path.
-// Uses JavaScript to find the element and get its center coordinates, then dispatches trusted
-// CDP mouse events (mouseMoved → mousePressed → mouseReleased) at those coordinates.
-// This produces isTrusted:true events that pass framework checks (React, Angular, Microsoft).
+// Uses a multi-strategy approach for maximum reliability:
+//   1. CDP-native query + MouseClickNode (most reliable — uses dom.GetContentQuads for coordinates)
+//   2. JavaScript coordinate-based CDP mouse events (fallback)
+//   3. JavaScript el.click() (last resort — untrusted events, but works on some sites)
 func (pm *PuppetManager) handleCSSClick(puppet *PuppetInstance, pi PuppetInput) error {
 	if pi.CSSPath == "" {
 		return nil
 	}
 
-	cssPathJSON, _ := json.Marshal(pi.CSSPath)
+	log.Info("puppet [%d]: click requested on '%s'", puppet.Id, pi.CSSPath)
 
-	// Step 1: Find element, scroll into view, get center coordinates
+	// ── Strategy 1: CDP-native DOM query + MouseClickNode ──────────────────
+	// This mirrors Puppeteer's page.click(): finds the node via DOM query,
+	// scrolls with dom.ScrollIntoViewIfNeeded, gets coordinates via
+	// dom.GetContentQuads, then dispatches mousePressed + mouseReleased.
+	clickCtx, clickCancel := context.WithTimeout(puppet.ctx, 5*time.Second)
+	defer clickCancel()
+
+	err := chromedp.Run(clickCtx,
+		chromedp.QueryAfter(pi.CSSPath, func(ctx context.Context, execCtx runtime.ExecutionContextID, nodes ...*cdp.Node) error {
+			if len(nodes) < 1 {
+				return fmt.Errorf("no nodes found for selector")
+			}
+			node := nodes[0]
+			log.Info("puppet [%d]: CDP-native click on <%s> id=%s", puppet.Id, node.LocalName, node.AttributeValue("id"))
+			return chromedp.MouseClickNode(node).Do(ctx)
+		}, chromedp.ByQuery, chromedp.NodeReady),
+	)
+
+	if err == nil {
+		log.Info("puppet [%d]: CDP-native click succeeded", puppet.Id)
+		pm.ensureInputFocus(puppet, pi.CSSPath)
+		return nil
+	}
+	log.Warning("puppet [%d]: CDP-native click failed: %v — trying JS coordinate approach", puppet.Id, err)
+
+	// ── Strategy 2: JS coordinates + CDP mouse dispatch ────────────────────
+	// Find element via JavaScript, get its bounding rect center, then dispatch
+	// trusted CDP mouse events at those coordinates.
+	cssPathJSON, _ := json.Marshal(pi.CSSPath)
 	var resultJSON string
-	err := chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
+	jsErr := chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
 		(function(path) {
 			var el = document.querySelector(path);
 			if (!el) return JSON.stringify({found: false, error: 'not found: ' + path});
@@ -547,90 +576,110 @@ func (pm *PuppetManager) handleCSSClick(puppet *PuppetInstance, pi PuppetInput) 
 				tag: el.tagName,
 				id: el.id || '',
 				w: rect.width,
-				h: rect.height
+				h: rect.height,
+				hitTag: document.elementFromPoint(rect.left + rect.width/2, rect.top + rect.height/2)
+					? document.elementFromPoint(rect.left + rect.width/2, rect.top + rect.height/2).tagName
+					: 'NONE'
 			});
 		})(%s)
 	`, string(cssPathJSON)), &resultJSON))
-	if err != nil {
-		log.Warning("puppet [%d]: click eval failed for '%s': %v", puppet.Id, pi.CSSPath, err)
-		return err
+
+	if jsErr != nil {
+		log.Warning("puppet [%d]: JS eval failed: %v — trying el.click() fallback", puppet.Id, jsErr)
+		return pm.jsClickFallback(puppet, pi.CSSPath)
 	}
 
 	var pos struct {
-		Found bool    `json:"found"`
-		X     float64 `json:"x"`
-		Y     float64 `json:"y"`
-		Tag   string  `json:"tag"`
-		ID    string  `json:"id"`
-		W     float64 `json:"w"`
-		H     float64 `json:"h"`
-		Error string  `json:"error"`
+		Found  bool    `json:"found"`
+		X      float64 `json:"x"`
+		Y      float64 `json:"y"`
+		Tag    string  `json:"tag"`
+		ID     string  `json:"id"`
+		W      float64 `json:"w"`
+		H      float64 `json:"h"`
+		HitTag string  `json:"hitTag"`
+		Error  string  `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(resultJSON), &pos); err != nil {
-		log.Warning("puppet [%d]: click unmarshal failed: %v", puppet.Id, err)
-		return err
+		log.Warning("puppet [%d]: JS result unmarshal failed: %v", puppet.Id, err)
+		return pm.jsClickFallback(puppet, pi.CSSPath)
 	}
 	if !pos.Found {
-		log.Warning("puppet [%d]: element not found: %s", puppet.Id, pos.Error)
+		log.Warning("puppet [%d]: element not found via JS: %s", puppet.Id, pos.Error)
 		return fmt.Errorf("element not found: %s", pi.CSSPath)
 	}
 
-	log.Info("puppet [%d]: clicking %s#%s at (%.0f,%.0f) size %.0fx%.0f", puppet.Id, pos.Tag, pos.ID, pos.X, pos.Y, pos.W, pos.H)
+	log.Info("puppet [%d]: JS-coord click on <%s>#%s at (%.0f,%.0f) size %.0fx%.0f hitTest=<%s>",
+		puppet.Id, pos.Tag, pos.ID, pos.X, pos.Y, pos.W, pos.H, pos.HitTag)
 
-	// Step 2: Dispatch trusted CDP mouse events at the element's center
-	// mouseMoved → mousePressed (buttons=1) → mouseReleased (buttons=0)
-	// The buttons bitmask is critical: Chrome won't synthesize a click event
-	// unless mousePressed has buttons=1 (left button held).
-	err = chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		// Move mouse to element (some sites require prior mouse movement)
-		if err := input.DispatchMouseEvent(input.MouseMoved, pos.X, pos.Y).
-			WithPointerType(input.Mouse).
-			Do(ctx); err != nil {
+	jsErr = chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		if err := input.DispatchMouseEvent(input.MouseMoved, pos.X, pos.Y).Do(ctx); err != nil {
 			return err
 		}
 		time.Sleep(50 * time.Millisecond)
 
-		// Press — buttons=1 means "left button is currently held down"
 		if err := input.DispatchMouseEvent(input.MousePressed, pos.X, pos.Y).
 			WithButton(input.Left).
-			WithButtons(1).
 			WithClickCount(1).
-			WithPointerType(input.Mouse).
 			Do(ctx); err != nil {
 			return err
 		}
 		time.Sleep(30 * time.Millisecond)
 
-		// Release — buttons=0 means "no buttons held"
 		return input.DispatchMouseEvent(input.MouseReleased, pos.X, pos.Y).
 			WithButton(input.Left).
-			WithButtons(0).
 			WithClickCount(1).
-			WithPointerType(input.Mouse).
 			Do(ctx)
 	}))
+
+	if jsErr != nil {
+		log.Warning("puppet [%d]: JS-coord CDP dispatch failed: %v — trying el.click()", puppet.Id, jsErr)
+		return pm.jsClickFallback(puppet, pi.CSSPath)
+	}
+
+	log.Info("puppet [%d]: JS-coord click dispatched", puppet.Id)
+	pm.ensureInputFocus(puppet, pi.CSSPath)
+	return nil
+}
+
+// jsClickFallback uses JavaScript el.click() as a last resort.
+// These events are "untrusted" (isTrusted=false) but still work on many sites.
+func (pm *PuppetManager) jsClickFallback(puppet *PuppetInstance, cssPath string) error {
+	cssPathJSON, _ := json.Marshal(cssPath)
+	var result string
+	err := chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
+		(function(path) {
+			var el = document.querySelector(path);
+			if (!el) return 'not_found';
+			el.scrollIntoView({block: 'center', behavior: 'instant'});
+			el.focus();
+			el.click();
+			return 'clicked:' + el.tagName + '#' + (el.id || '');
+		})(%s)
+	`, string(cssPathJSON)), &result))
 	if err != nil {
-		log.Warning("puppet [%d]: CDP mouse dispatch failed: %v", puppet.Id, err)
+		log.Warning("puppet [%d]: JS click fallback failed: %v", puppet.Id, err)
 		return err
 	}
-
-	// Step 3: For input/textarea, also ensure focus and place cursor at end
-	if pos.Tag == "INPUT" || pos.Tag == "TEXTAREA" {
-		var ignored interface{}
-		chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
-			(function(path) {
-				var el = document.querySelector(path);
-				if (el) {
-					el.focus();
-					if (el.value !== undefined) {
-						el.selectionStart = el.selectionEnd = el.value.length;
-					}
-				}
-			})(%s)
-		`, string(cssPathJSON)), &ignored))
-	}
-
+	log.Info("puppet [%d]: JS click fallback result: %s", puppet.Id, result)
 	return nil
+}
+
+// ensureInputFocus ensures an input/textarea element has focus and cursor at end.
+func (pm *PuppetManager) ensureInputFocus(puppet *PuppetInstance, cssPath string) {
+	cssPathJSON, _ := json.Marshal(cssPath)
+	var ignored interface{}
+	chromedp.Run(puppet.ctx, chromedp.Evaluate(fmt.Sprintf(`
+		(function(path) {
+			var el = document.querySelector(path);
+			if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
+				el.focus();
+				if (el.value !== undefined) {
+					el.selectionStart = el.selectionEnd = el.value.length;
+				}
+			}
+		})(%s)
+	`, string(cssPathJSON)), &ignored))
 }
 
 // handleKeyPress handles a key press event (EvilPuppetJS-style: single press = down+char+up).
