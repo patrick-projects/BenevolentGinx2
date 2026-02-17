@@ -302,6 +302,55 @@ else
     warn "noVNC not found — install with: apt install novnc"
 fi
 
+# ─── Step 1b: Install Windows fonts (font fingerprint evasion) ──────
+step "Installing Windows-compatible fonts for fingerprint consistency"
+# Font fingerprinting checks which fonts are available. A Linux server with only
+# DejaVu/Liberation fonts looks nothing like a Windows desktop. These packages
+# provide the core Windows/macOS font families (Arial, Times New Roman, Verdana,
+# Georgia, Trebuchet MS, etc.) so font enumeration matches a real user's machine.
+echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | debconf-set-selections 2>/dev/null || true
+apt-get install -y -qq \
+    fontconfig \
+    fonts-liberation \
+    fonts-noto \
+    fonts-noto-cjk \
+    > /dev/null 2>&1
+
+# Try to install Microsoft core fonts (may not be available on all repos)
+apt-get install -y -qq ttf-mscorefonts-installer > /dev/null 2>&1 || \
+    warn "ttf-mscorefonts-installer not available — Liberation fonts provide compatible alternatives"
+
+# Rebuild font cache so Chromium picks them up immediately
+fc-cache -f > /dev/null 2>&1
+FONT_COUNT=$(fc-list | wc -l)
+info "Font cache rebuilt — $FONT_COUNT fonts available to Chromium"
+
+# ─── Step 1c: TCP/IP fingerprint (TTL matching) ─────────────────────
+step "Configuring TCP/IP stack to match Windows fingerprint"
+# Our User-Agent claims to be Windows. Linux's default TTL is 64, Windows is 128.
+# If a detector does a network-level check (unlikely but possible with advanced
+# bot detection like PerimeterX/DataDome), mismatched TTL is a red flag.
+CURRENT_TTL=$(sysctl -n net.ipv4.ip_default_ttl 2>/dev/null || echo "64")
+if [ "$CURRENT_TTL" != "128" ]; then
+    sysctl -w net.ipv4.ip_default_ttl=128 > /dev/null 2>&1
+    info "TCP TTL changed from $CURRENT_TTL to 128 (matches Windows)"
+    # Make it persist across reboots
+    if ! grep -q 'net.ipv4.ip_default_ttl' /etc/sysctl.conf 2>/dev/null; then
+        echo "net.ipv4.ip_default_ttl = 128" >> /etc/sysctl.conf
+        info "TTL setting persisted in /etc/sysctl.conf"
+    else
+        sed -i 's/net.ipv4.ip_default_ttl.*/net.ipv4.ip_default_ttl = 128/' /etc/sysctl.conf
+        info "TTL setting updated in /etc/sysctl.conf"
+    fi
+else
+    info "TTL already set to 128 (matches Windows)"
+fi
+
+# Also set TCP window size to match typical Windows values
+sysctl -w net.ipv4.tcp_window_scaling=1 > /dev/null 2>&1
+sysctl -w net.core.rmem_default=65536 > /dev/null 2>&1
+info "TCP window settings adjusted for Windows-like behavior"
+
 # ─── Step 2: Install Go (if not present or too old) ─────────────────
 step "Checking Go installation"
 NEED_GO=true

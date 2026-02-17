@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"math/rand"
 	"os"
 	"os/exec"
 	"strconv"
@@ -714,10 +716,64 @@ func (pm *PuppetManager) HandleInput(puppetId int, pi PuppetInput) error {
 	return nil
 }
 
+// humanDelay returns a random duration that simulates human typing speed.
+// Average human typing is 200ms between keys (~60 WPM), but varies per character.
+// This returns a realistic distribution: mostly 50-150ms with occasional pauses.
+func humanDelay() time.Duration {
+	base := 50 + rand.Intn(100)  // 50-150ms base
+	if rand.Intn(10) == 0 {      // 10% chance of a small pause (thinking)
+		base += 100 + rand.Intn(200) // extra 100-300ms
+	}
+	return time.Duration(base) * time.Millisecond
+}
+
+// simulateMouseMovement generates a natural-looking mouse movement from the current
+// position to (targetX, targetY) using a Bezier curve with slight randomization.
+// Real users don't teleport — they move in smooth arcs with slight jitter.
+func simulateMouseMovement(ctx context.Context, targetX, targetY float64) error {
+	// Start from a slightly offset position (simulates mouse coming from elsewhere)
+	startX := targetX - 100 - float64(rand.Intn(200))
+	startY := targetY - 50 - float64(rand.Intn(100))
+	if startX < 0 {
+		startX = float64(rand.Intn(100))
+	}
+	if startY < 0 {
+		startY = float64(rand.Intn(50))
+	}
+
+	// Bezier control point (creates arc, not straight line)
+	cpX := (startX + targetX) / 2 + float64(rand.Intn(60)-30)
+	cpY := (startY + targetY) / 2 + float64(rand.Intn(60)-30)
+
+	// Number of steps (more = smoother but slower)
+	steps := 8 + rand.Intn(8) // 8-15 steps
+	for i := 0; i <= steps; i++ {
+		t := float64(i) / float64(steps)
+		// Quadratic Bezier: B(t) = (1-t)²·P0 + 2(1-t)t·CP + t²·P1
+		u := 1 - t
+		x := u*u*startX + 2*u*t*cpX + t*t*targetX
+		y := u*u*startY + 2*u*t*cpY + t*t*targetY
+
+		// Add tiny jitter to avoid perfectly smooth curves (detectable)
+		x += float64(rand.Intn(3) - 1)
+		y += float64(rand.Intn(3) - 1)
+
+		if err := input.DispatchMouseEvent(input.MouseMoved, math.Round(x), math.Round(y)).Do(ctx); err != nil {
+			return err
+		}
+		// Variable speed: slower at start and end (ease in/out)
+		delay := 5 + rand.Intn(10) // 5-15ms between points
+		time.Sleep(time.Duration(delay) * time.Millisecond)
+	}
+
+	// Final move to exact target
+	return input.DispatchMouseEvent(input.MouseMoved, targetX, targetY).Do(ctx)
+}
+
 // handleClick dispatches a mouse click at the given viewport coordinates.
 // The client iframe renders at the exact same dimensions as the puppet browser (1920x1080),
 // so the coordinates from the client map 1:1 to the puppet's viewport.
-// This is the same approach as page.mouse.click(x, y) in Puppeteer.
+// Includes human-like mouse movement before clicking.
 func (pm *PuppetManager) handleClick(puppet *PuppetInstance, pi PuppetInput) error {
 	// Primary strategy: CSS selector click (like EvilPuppetJS).
 	// The client sends getCssPath(e.target) which identifies the exact element.
@@ -783,10 +839,11 @@ func (pm *PuppetManager) handleClick(puppet *PuppetInstance, pi PuppetInput) err
 	}
 	log.Info("puppet [%d]: coordinate click at (%.0f, %.0f)", puppet.Id, pi.X, pi.Y)
 	err := chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		if err := input.DispatchMouseEvent(input.MouseMoved, pi.X, pi.Y).Do(ctx); err != nil {
+		// Simulate human mouse movement (Bezier curve) to the click target
+		if err := simulateMouseMovement(ctx, pi.X, pi.Y); err != nil {
 			return err
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(time.Duration(20+rand.Intn(40)) * time.Millisecond) // 20-60ms pause before click
 
 		if err := input.DispatchMouseEvent(input.MousePressed, pi.X, pi.Y).
 			WithButton(input.Left).
@@ -794,7 +851,7 @@ func (pm *PuppetManager) handleClick(puppet *PuppetInstance, pi PuppetInput) err
 			Do(ctx); err != nil {
 			return err
 		}
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(time.Duration(50+rand.Intn(80)) * time.Millisecond) // 50-130ms hold (humans hold briefly)
 
 		return input.DispatchMouseEvent(input.MouseReleased, pi.X, pi.Y).
 			WithButton(input.Left).
@@ -873,11 +930,11 @@ func ensureFocus(ctx context.Context, puppetCtx context.Context, cssPath string)
 	}
 }
 
-// handleKeyPress handles a key press event.
+// handleKeyPress handles a key press event with human-like timing.
 // Matches Puppeteer's keyboard.press() exactly: KeyDown(with text) + KeyUp.
 // The text parameter on KeyDown tells Chrome to perform text insertion,
 // generating keydown → keypress → input events — the full native sequence.
-// InsertText (sendCharacter) is used only as a fallback for edge cases.
+// A random delay is inserted before each keypress to simulate human typing speed.
 func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) error {
 	keyName := pi.Key
 	if keyName == "" {
@@ -889,10 +946,12 @@ func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) 
 	log.Info("puppet [%d]: keypress key='%s' code='%s' cssPath='%s'", puppet.Id, keyName, pi.Code, pi.CSSPath)
 
 	// Ensure the correct element has focus before dispatching key events.
-	// The client sends the CSS path of the focused element with every keypress.
 	if pi.CSSPath != "" {
 		ensureFocus(puppet.ctx, puppet.ctx, pi.CSSPath)
 	}
+
+	// Human-like delay before each keypress (real humans don't type at machine speed)
+	time.Sleep(humanDelay())
 
 	switch keyName {
 	case "CtrlBackspace":
@@ -941,12 +1000,14 @@ func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) 
 					Do(ctx)
 
 				if err != nil {
-					// Fallback: use InsertText (like EvilPuppetJS's sendCharacter fallback)
 					log.Warning("puppet [%d]: KeyDown failed for '%s': %v — trying InsertText", puppet.Id, keyName, err)
 					if err2 := input.InsertText(keyName).Do(ctx); err2 != nil {
 						return err2
 					}
 				}
+
+				// Realistic key hold time (humans hold keys for 30-80ms before releasing)
+				time.Sleep(time.Duration(30+rand.Intn(50)) * time.Millisecond)
 
 				return input.DispatchKeyEvent(input.KeyUp).
 					WithKey(keyName).
@@ -1633,10 +1694,128 @@ var stealthScript = `(function() {
     } catch(e) {}
 
     // =========================================================================
-    // 7. IFRAME CONSISTENCY
-    //    AddScriptToEvaluateOnNewDocument runs in all frames automatically,
-    //    but some detectors create fresh iframes and check properties there.
-    //    This observer patches new iframes as they appear.
+    // 7. CANVAS FINGERPRINT NOISE
+    //    Canvas fingerprinting creates a unique image hash. Software rendering
+    //    (Xvfb/headless) produces different results than real GPUs. We add subtle
+    //    random noise to canvas output so the fingerprint looks unique but not
+    //    like a known headless fingerprint.
+    // =========================================================================
+    try {
+        var _origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+        HTMLCanvasElement.prototype.toDataURL = function() {
+            var ctx2d = this.getContext('2d');
+            if (ctx2d) {
+                var style = ctx2d.fillStyle;
+                ctx2d.fillStyle = 'rgba(' + Math.floor(Math.random()*2) + ',' +
+                    Math.floor(Math.random()*2) + ',' +
+                    Math.floor(Math.random()*2) + ',0.01)';
+                ctx2d.fillRect(0, 0, 1, 1);
+                ctx2d.fillStyle = style;
+            }
+            return _origToDataURL.apply(this, arguments);
+        };
+        _tsMap.set(HTMLCanvasElement.prototype.toDataURL, _origToString.call(_origToDataURL));
+
+        var _origToBlob = HTMLCanvasElement.prototype.toBlob;
+        HTMLCanvasElement.prototype.toBlob = function() {
+            var ctx2d = this.getContext('2d');
+            if (ctx2d) {
+                var style = ctx2d.fillStyle;
+                ctx2d.fillStyle = 'rgba(' + Math.floor(Math.random()*2) + ',' +
+                    Math.floor(Math.random()*2) + ',' +
+                    Math.floor(Math.random()*2) + ',0.01)';
+                ctx2d.fillRect(0, 0, 1, 1);
+                ctx2d.fillStyle = style;
+            }
+            return _origToBlob.apply(this, arguments);
+        };
+        _tsMap.set(HTMLCanvasElement.prototype.toBlob, _origToString.call(_origToBlob));
+
+        // Also intercept getImageData for readback-based fingerprinting
+        var _origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+        CanvasRenderingContext2D.prototype.getImageData = function() {
+            var imageData = _origGetImageData.apply(this, arguments);
+            // Add imperceptible noise to a few random pixels
+            for (var i = 0; i < 4; i++) {
+                var idx = Math.floor(Math.random() * imageData.data.length / 4) * 4;
+                imageData.data[idx] = imageData.data[idx] ^ (Math.random() > 0.5 ? 1 : 0);
+            }
+            return imageData;
+        };
+        _tsMap.set(CanvasRenderingContext2D.prototype.getImageData, _origToString.call(_origGetImageData));
+    } catch(e) {}
+
+    // =========================================================================
+    // 8. AUDIO FINGERPRINT
+    //    AudioContext fingerprinting uses oscillator + compressor output to
+    //    create a unique hash. We add subtle noise to the output.
+    // =========================================================================
+    try {
+        var _origCreateOscillator = (window.AudioContext || window.webkitAudioContext || function(){}).prototype.createOscillator;
+        if (_origCreateOscillator) {
+            var AudioCtx = window.AudioContext || window.webkitAudioContext;
+            var _origGetFloatFreqData = AnalyserNode.prototype.getFloatFrequencyData;
+            AnalyserNode.prototype.getFloatFrequencyData = function(array) {
+                _origGetFloatFreqData.call(this, array);
+                for (var i = 0; i < array.length; i += 100) {
+                    array[i] = array[i] + Math.random() * 0.0001;
+                }
+            };
+            _tsMap.set(AnalyserNode.prototype.getFloatFrequencyData, _origToString.call(_origGetFloatFreqData));
+        }
+    } catch(e) {}
+
+    // =========================================================================
+    // 9. CDP (CHROME DEVTOOLS PROTOCOL) DETECTION EVASION
+    //    Some detectors check for side-effects of CDP being attached:
+    //    - console.debug() behavior differs when CDP Runtime is enabled
+    //    - Error.prepareStackTrace can reveal CDP frames
+    //    - window.__coverage__ is set by some CDP tools
+    // =========================================================================
+    try {
+        // Patch console.debug to behave normally (CDP Runtime.enable changes it)
+        var _origDebug = console.debug;
+        Object.defineProperty(console, 'debug', {
+            value: function() { return _origDebug.apply(console, arguments); },
+            writable: true, configurable: true
+        });
+
+        // Remove CDP-injected __coverage__ and similar globals
+        ['__coverage__', '__REACT_DEVTOOLS_GLOBAL_HOOK__'].forEach(function(k) {
+            try { if (window[k]) delete window[k]; } catch(e) {}
+        });
+
+        // Prevent detection via Error stack traces revealing CDP internal frames
+        var _origPrepareStack = Error.prepareStackTrace;
+        if (_origPrepareStack) {
+            Error.prepareStackTrace = function(error, stack) {
+                var filtered = stack.filter(function(frame) {
+                    var fn = frame.getFileName() || '';
+                    return fn.indexOf('__puppeteer_evaluation_script__') === -1 &&
+                           fn.indexOf('pptr:') === -1;
+                });
+                return _origPrepareStack(error, filtered);
+            };
+        }
+    } catch(e) {}
+
+    // =========================================================================
+    // 10. TIMING ATTACK DEFENSE
+    //     Some detectors measure performance.now() precision — headless Chrome
+    //     can have different timer resolution. We add sub-ms noise.
+    // =========================================================================
+    try {
+        var _origPerfNow = performance.now.bind(performance);
+        patchFn(performance, 'now', function() {
+            return _origPerfNow() + Math.random() * 0.1; // up to 0.1ms jitter
+        });
+    } catch(e) {}
+
+    // =========================================================================
+    // 11. IFRAME CONSISTENCY
+    //     AddScriptToEvaluateOnNewDocument runs in all frames automatically,
+    //     but some detectors create fresh iframes and check properties there.
+    //     This observer patches new iframes as they appear.
     // =========================================================================
     try {
         var iframeObserver = new MutationObserver(function(mutations) {
