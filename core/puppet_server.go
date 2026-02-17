@@ -419,10 +419,18 @@ body {
     padding: 0 8px;
 }
 .puppet-info .label { color: #58a6ff; font-weight: 600; }
-#viewport {
+#viewport-wrapper {
     flex: 1;
+    overflow: hidden;
+    position: relative;
+    background: #1a1a2e;
+}
+#viewport {
+    position: absolute;
+    width: 1920px;
+    height: 1080px;
     border: none;
-    width: 100%%;
+    transform-origin: top left;
     background: #fff;
 }
 .statusbar {
@@ -485,7 +493,9 @@ body {
     </div>
 </div>
 
-<iframe id="viewport"></iframe>
+<div id="viewport-wrapper">
+    <iframe id="viewport"></iframe>
+</div>
 
 <div class="loading-overlay" id="loading">
     <div class="loading-spinner"></div>
@@ -507,18 +517,36 @@ body {
     var updatesEl = document.getElementById('updates');
     var loadingEl = document.getElementById('loading');
     var viewport = document.getElementById('viewport');
+    var viewportWrapper = document.getElementById('viewport-wrapper');
 
+    var PUPPET_W = 1920, PUPPET_H = 1080;
     var ws = null;
     var updateCount = 0;
     var reconnectDelay = 1000;
     var initialized = false;
     var iframeDoc = null;
 
+    // Scale the 1920x1080 iframe to fit available space
+    function updateScale() {
+        var availW = viewportWrapper.clientWidth;
+        var availH = viewportWrapper.clientHeight;
+        if (availW <= 0 || availH <= 0) return;
+        var scale = Math.min(availW / PUPPET_W, availH / PUPPET_H);
+        viewport.style.transform = 'scale(' + scale + ')';
+        var scaledW = PUPPET_W * scale;
+        var offsetX = Math.max(0, (availW - scaledW) / 2);
+        viewport.style.left = offsetX + 'px';
+        viewport.style.top = '0px';
+    }
+    window.addEventListener('resize', updateScale);
+    setTimeout(updateScale, 0);
+
     // Initialize the iframe document
     viewport.srcdoc = '<html><head></head><body></body></html>';
     viewport.onload = function() {
         iframeDoc = viewport.contentDocument || viewport.contentWindow.document;
         setupIframeEvents();
+        updateScale();
     };
 
     // ---- CSS Path computation (matches EvilPuppetJS) ----
@@ -672,13 +700,12 @@ body {
     function setupIframeEvents() {
         if (!iframeDoc) return;
 
-        // Click handler
+        // Click handler — send viewport coordinates directly
+        // The iframe is fixed at 1920x1080 (matching the puppet browser viewport),
+        // so e.clientX/e.clientY map 1:1 to the puppet's coordinate space.
         iframeDoc.addEventListener('click', function(e) {
             e.preventDefault();
-            var cssPath = getCssPath(e.target);
-            if (cssPath) {
-                sendInput({type: 'click', cssPath: cssPath});
-            }
+            sendInput({type: 'click', x: e.clientX, y: e.clientY});
         });
 
         // Prevent default on mousedown to stop text selection interfering
