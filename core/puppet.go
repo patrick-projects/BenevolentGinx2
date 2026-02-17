@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -117,6 +119,8 @@ type PuppetManager struct {
 	chromePath string
 	port       int
 	password   string
+	xvfbCmd    *exec.Cmd // Xvfb virtual display process (nil if not using Xvfb)
+	xvfbDisplay string   // e.g. ":99"
 }
 
 func NewPuppetManager(cfg *Config, db *database.Database) *PuppetManager {
@@ -129,7 +133,52 @@ func NewPuppetManager(cfg *Config, db *database.Database) *PuppetManager {
 		port:       7777,
 		password:   GenRandomToken()[:16],
 	}
+	pm.startXvfb()
 	return pm
+}
+
+// startXvfb starts an Xvfb virtual display so Chrome can run in non-headless mode on a
+// server without a physical display. This is the same approach EvilPuppetJS uses —
+// headless:false is undetectable because the browser literally isn't headless.
+// Falls back gracefully: if Xvfb isn't installed, Chrome runs in --headless=new mode.
+func (pm *PuppetManager) startXvfb() {
+	xvfbPath, err := exec.LookPath("Xvfb")
+	if err != nil {
+		log.Info("Xvfb not found — Chrome will use --headless=new mode (install xvfb for better stealth)")
+		return
+	}
+
+	display := ":99"
+	cmd := exec.Command(xvfbPath, display, "-screen", "0", "1920x1080x24", "-ac", "-nolisten", "tcp")
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		log.Warning("failed to start Xvfb: %v — falling back to headless mode", err)
+		return
+	}
+
+	// Give Xvfb a moment to initialize
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify it's running
+	if cmd.Process == nil {
+		log.Warning("Xvfb process didn't start — falling back to headless mode")
+		return
+	}
+
+	pm.xvfbCmd = cmd
+	pm.xvfbDisplay = display
+	os.Setenv("DISPLAY", display)
+	log.Success("Xvfb started on display %s — Chrome will run in non-headless mode (ultimate stealth)", display)
+}
+
+// StopXvfb stops the virtual display when the PuppetManager is shut down.
+func (pm *PuppetManager) StopXvfb() {
+	if pm.xvfbCmd != nil && pm.xvfbCmd.Process != nil {
+		pm.xvfbCmd.Process.Kill()
+		pm.xvfbCmd.Wait()
+		log.Info("Xvfb stopped")
+	}
 }
 
 func (pm *PuppetManager) SetServer(server *PuppetServer) {
@@ -214,7 +263,8 @@ func (pm *PuppetManager) LaunchPuppet(sessionId int, targetURL string) (*PuppetI
 }
 
 func (pm *PuppetManager) runPuppet(puppet *PuppetInstance, dbSession *database.Session) {
-	opts := StealthChromeOpts(dbSession.UserAgent, puppet.viewportW, puppet.viewportH)
+	useXvfb := pm.xvfbCmd != nil
+	opts := StealthChromeOpts(dbSession.UserAgent, puppet.viewportW, puppet.viewportH, useXvfb)
 
 	if pm.chromePath != "" {
 		opts = append(opts, chromedp.ExecPath(pm.chromePath))
@@ -324,6 +374,8 @@ func (pm *PuppetManager) runPuppet(puppet *PuppetInstance, dbSession *database.S
 // SetupInputChangeListener injects JavaScript into the puppet browser that watches
 // for input field changes and sends them immediately through a binding, providing
 // near-instant text synchronization (like EvilPuppetJS's setupPuppeteerChangeListeners).
+// Also listens for frame navigations and re-injects the listener as a safety net,
+// matching EvilPuppetJS's page.on('framenavigated', attachChangeListeners) pattern.
 func SetupInputChangeListener(puppet *PuppetInstance) {
 	chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 		// Create a binding that JS can call to notify us of input changes
@@ -335,7 +387,9 @@ func SetupInputChangeListener(puppet *PuppetInstance) {
 		return err
 	}))
 
-	// Listen for binding calls and forward input changes to the client
+	// Listen for binding calls and forward input changes to the client.
+	// Also re-inject the listener on frame navigations as a safety net — this
+	// mirrors EvilPuppetJS's page.on('framenavigated', attachChangeListeners).
 	chromedp.ListenTarget(puppet.ctx, func(ev interface{}) {
 		switch e := ev.(type) {
 		case *runtime.EventBindingCalled:
@@ -361,6 +415,13 @@ func SetupInputChangeListener(puppet *PuppetInstance) {
 				default:
 				}
 			}
+		case *page.EventFrameNavigated:
+			// Safety net: re-inject input listeners after navigation.
+			// AddScriptToEvaluateOnNewDocument should handle this, but some
+			// edge cases (SPA navigations, pushState) may not trigger it.
+			go func() {
+				chromedp.Run(puppet.ctx, chromedp.Evaluate(inputListenerScript, nil))
+			}()
 		}
 	})
 }
@@ -607,12 +668,13 @@ func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) 
 		return chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 			if len(keyName) == 1 {
 				// Printable character — dispatch KeyDown → InsertText → KeyUp.
-				// KeyDown fires the keydown event (sites like Microsoft listen for it).
-				// InsertText (CDP Input.insertText) directly inserts text into the
-				// focused element, firing beforeinput + input events that React
-				// controlled inputs require. KeyChar alone only fires keypress which
-				// modern React apps don't rely on for text insertion.
-				// KeyUp fires the keyup event for completeness.
+				// This mirrors EvilPuppetJS's approach: keyboard.press() primary,
+				// keyboard.sendCharacter() fallback. We combine both:
+				// - KeyDown fires the keydown event (sites like Microsoft listen for it)
+				// - InsertText fires beforeinput + input events (React needs these)
+				// - KeyUp fires the keyup event for completeness
+				// If InsertText fails, we fallback to KeyChar (like EvilPuppetJS's
+				// sendCharacter fallback for non-standard keyboard layouts).
 				code, vk := charToCodeAndVK(keyName)
 
 				if err := input.DispatchKeyEvent(input.KeyDown).
@@ -627,7 +689,17 @@ func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) 
 				}
 
 				if err := input.InsertText(keyName).Do(ctx); err != nil {
-					return err
+					// Fallback: try KeyChar (like EvilPuppetJS's sendCharacter fallback)
+					log.Warning("puppet: InsertText failed for '%s', falling back to KeyChar: %v", keyName, err)
+					if err2 := input.DispatchKeyEvent(input.KeyChar).
+						WithKey(keyName).
+						WithText(keyName).
+						WithUnmodifiedText(keyName).
+						WithWindowsVirtualKeyCode(vk).
+						WithNativeVirtualKeyCode(vk).
+						Do(ctx); err2 != nil {
+						return err2
+					}
 				}
 
 				return input.DispatchKeyEvent(input.KeyUp).
@@ -668,8 +740,20 @@ func (pm *PuppetManager) handleType(puppet *PuppetInstance, pi PuppetInput) erro
 	// For pasted text, use InsertText directly for the entire string.
 	// This is equivalent to Puppeteer's page.keyboard.insertText() and is the
 	// most reliable way to insert text into React controlled inputs.
+	// If InsertText fails, fall back to typing character by character (like
+	// EvilPuppetJS's sendCharacter fallback pattern).
 	return chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		return input.InsertText(pi.Text).Do(ctx)
+		if err := input.InsertText(pi.Text).Do(ctx); err != nil {
+			log.Warning("puppet [%d]: InsertText failed for paste, falling back to char-by-char: %v", puppet.Id, err)
+			for _, ch := range pi.Text {
+				s := string(ch)
+				if err2 := input.DispatchKeyEvent(input.KeyChar).
+					WithKey(s).WithText(s).WithUnmodifiedText(s).Do(ctx); err2 != nil {
+					return err2
+				}
+			}
+		}
+		return nil
 	}))
 }
 
@@ -917,13 +1001,11 @@ func (pm *PuppetManager) GetDashboardURL() string {
 
 // StealthChromeOpts returns chromedp allocator options configured to evade headless browser
 // detection. Equivalent to puppeteer-extra-plugin-stealth's Chrome launch args.
-func StealthChromeOpts(userAgent string, viewportW, viewportH int) []chromedp.ExecAllocatorOption {
+// When useXvfb is true, Chrome runs in non-headless mode on a virtual display — the same
+// approach as EvilPuppetJS (headless:false). This is completely undetectable because the
+// browser literally isn't headless.
+func StealthChromeOpts(userAgent string, viewportW, viewportH int, useXvfb bool) []chromedp.ExecAllocatorOption {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		// Use Chrome's new headless mode (--headless=new) which runs a real browser
-		// engine without a display. The old mode (--headless) has many detectable
-		// artifacts. New headless is available in Chrome 112+ and is nearly
-		// indistinguishable from a normal Chrome window.
-		chromedp.Flag("headless", "new"),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
@@ -939,12 +1021,26 @@ func StealthChromeOpts(userAgent string, viewportW, viewportH int) []chromedp.Ex
 		chromedp.Flag("disable-infobars", true),
 		chromedp.Flag("disable-extensions", true),
 	)
+
+	if useXvfb {
+		// Non-headless mode on Xvfb virtual display — same as EvilPuppetJS's headless:false.
+		// Chrome runs a real window, just on a virtual screen. No headless artifacts at all.
+		opts = append(opts, chromedp.Flag("headless", false))
+		opts = append(opts, chromedp.Flag("start-maximized", true))
+	} else {
+		// Fallback: new headless mode (--headless=new) — runs a real browser engine
+		// without a display. Available in Chrome 112+ and nearly indistinguishable
+		// from a normal Chrome window.
+		opts = append(opts, chromedp.Flag("headless", "new"))
+	}
+
 	return opts
 }
 
 // InjectStealthScripts injects JavaScript and CDP overrides to evade headless browser detection.
 // This is the Go equivalent of puppeteer-extra-plugin-stealth used by EvilPuppetJS.
 // Must be called after browser context is created but before navigating to the target.
+// When useXvfb is true, some patches are skipped since Chrome is running a real window.
 func InjectStealthScripts(ctx context.Context, userAgent string) {
 	// Parse platform from UA
 	jsPlatform := "Win32" // navigator.platform

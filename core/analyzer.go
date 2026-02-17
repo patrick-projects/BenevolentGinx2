@@ -214,7 +214,7 @@ func (a *Analyzer) StartAnalysis(targetURL string) (*AnalyzerSession, error) {
 
 func (a *Analyzer) runRecording(sess *AnalyzerSession) {
 	analyzerUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-	opts := StealthChromeOpts(analyzerUA, sess.viewportW, sess.viewportH)
+	opts := StealthChromeOpts(analyzerUA, sess.viewportW, sess.viewportH, a.pm.xvfbCmd != nil)
 
 	if a.pm.chromePath != "" {
 		opts = append(opts, chromedp.ExecPath(a.pm.chromePath))

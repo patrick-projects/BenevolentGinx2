@@ -53,11 +53,16 @@ case "$MACHINE" in
     *)       error "Unsupported architecture: $MACHINE"; exit 1 ;;
 esac
 
-# ─── Step 0: Clean up leftover artifacts ─────────────────────────────
-step "Cleaning up leftover artifacts to free disk space"
+# ─── Step 0: Aggressive cleanup to free disk space ───────────────────
+step "Aggressive cleanup to free disk space (small droplet mode)"
 FREED=0
+BEFORE_KB=$(df / | awk 'NR==2{print $3}')
 
-# Go build cache (can grow to hundreds of MB)
+info "Disk before cleanup: $(df -h / | awk 'NR==2{print $3 " used / " $2 " total (" $5 " full)"}')"
+
+# ---------- Go caches (often 500MB+) ----------
+
+# Go build cache
 if [ -d "/root/.cache/go-build" ]; then
     SZ=$(du -sm /root/.cache/go-build 2>/dev/null | awk '{print $1}')
     rm -rf /root/.cache/go-build
@@ -73,15 +78,9 @@ if [ -d "/root/go/pkg/mod" ]; then
     info "Cleared Go module cache (${SZ}MB)"
 fi
 
-# Previous build artifacts in the source directory
-for f in "$SCRIPT_DIR/build/evilginx" "$SCRIPT_DIR/evilginx2" "$SCRIPT_DIR/evilginx"; do
-    if [ -f "$f" ]; then
-        SZ=$(du -sm "$f" 2>/dev/null | awk '{print $1}')
-        rm -f "$f"
-        FREED=$((FREED + SZ))
-        info "Removed old binary: $f (${SZ}MB)"
-    fi
-done
+# Go test cache
+rm -rf /root/.cache/go-cgo 2>/dev/null
+rm -rf /root/.cache/go 2>/dev/null
 
 # Stale vendor directory (will be recreated by go mod vendor)
 if [ -d "$SCRIPT_DIR/vendor" ]; then
@@ -91,34 +90,32 @@ if [ -d "$SCRIPT_DIR/vendor" ]; then
     info "Cleared stale vendor directory (${SZ}MB)"
 fi
 
-# APT package cache
-if [ -d "/var/cache/apt/archives" ]; then
-    SZ=$(du -sm /var/cache/apt/archives 2>/dev/null | awk '{print $1}')
-    apt-get clean -qq 2>/dev/null || true
-    NEWZ=$(du -sm /var/cache/apt/archives 2>/dev/null | awk '{print $1}')
-    DIFF=$((SZ - NEWZ))
-    if [ "$DIFF" -gt 0 ]; then
-        FREED=$((FREED + DIFF))
-        info "Cleaned APT cache (${DIFF}MB)"
+# Previous build artifacts
+for f in "$SCRIPT_DIR/build/evilginx" "$SCRIPT_DIR/evilginx2" "$SCRIPT_DIR/evilginx"; do
+    if [ -f "$f" ]; then
+        SZ=$(du -sm "$f" 2>/dev/null | awk '{print $1}')
+        rm -f "$f"
+        FREED=$((FREED + SZ))
+        info "Removed old binary: $f (${SZ}MB)"
     fi
-fi
+done
 
-# Old systemd journal logs (keep only last 50MB)
-if command -v journalctl &>/dev/null; then
-    journalctl --vacuum-size=50M >/dev/null 2>&1 && info "Trimmed systemd journal to 50MB"
-fi
+# ---------- /tmp cleanup (Go build creates huge temp dirs) ----------
 
-# Chromium crash dumps and temp data from previous puppet sessions
-for d in /root/.config/chromium/Crash\ Reports /tmp/.org.chromium.Chromium* /tmp/chromium-* /tmp/puppeteer_dev_chrome_profile-*; do
+# Go build temp directories from previous failed/completed builds
+for d in /tmp/go-build*; do
     if [ -e "$d" ]; then
         SZ=$(du -sm "$d" 2>/dev/null | awk '{print $1}')
         rm -rf "$d"
         FREED=$((FREED + SZ))
-        info "Removed Chromium temp: $d (${SZ}MB)"
+        info "Removed Go build temp: $(basename $d) (${SZ}MB)"
     fi
 done
 
-# Old Go tarballs left in /tmp
+# CGo temp files
+rm -f /tmp/cgo-gcc-input-* 2>/dev/null
+
+# Old Go tarballs
 for f in /tmp/go*.linux-*.tar.gz; do
     if [ -f "$f" ]; then
         SZ=$(du -sm "$f" 2>/dev/null | awk '{print $1}')
@@ -128,21 +125,146 @@ for f in /tmp/go*.linux-*.tar.gz; do
     fi
 done
 
-# Orphaned snap cache (if snap is present)
+# Chromium crash dumps and temp data from previous puppet sessions
+for d in /root/.config/chromium/Crash\ Reports \
+         /root/.config/chromium/Default/Service\ Worker \
+         /root/.config/chromium/Default/Cache \
+         /root/.config/chromium/Default/Code\ Cache \
+         /root/.config/chromium/Default/GPUCache \
+         /root/.config/chromium/ShaderCache \
+         /root/.config/chromium/GrShaderCache \
+         /tmp/.org.chromium.Chromium* \
+         /tmp/chromium-* \
+         /tmp/puppeteer_dev_chrome_profile-* \
+         /tmp/.X99-lock \
+         /tmp/xvfb-run.* \
+         /tmp/chrome_crashpad* \
+         /tmp/Temp-*; do
+    if [ -e "$d" ]; then
+        SZ=$(du -sm "$d" 2>/dev/null | awk '{print $1}')
+        rm -rf "$d"
+        FREED=$((FREED + SZ))
+        info "Removed temp: $(basename "$d") (${SZ}MB)"
+    fi
+done
+
+# ---------- APT cleanup (100-300MB) ----------
+
+apt-get clean -qq 2>/dev/null || true
+apt-get autoclean -qq 2>/dev/null || true
+apt-get autoremove -y -qq 2>/dev/null || true
+info "Cleaned APT caches"
+
+# APT package lists (re-downloaded by apt-get update anyway)
+if [ -d "/var/lib/apt/lists" ]; then
+    SZ=$(du -sm /var/lib/apt/lists 2>/dev/null | awk '{print $1}')
+    rm -rf /var/lib/apt/lists/*
+    FREED=$((FREED + SZ))
+    info "Cleared APT lists (${SZ}MB)"
+fi
+
+# ---------- Logs (can grow to hundreds of MB) ----------
+
+# Systemd journal — keep only last 10MB on small droplets
+if command -v journalctl &>/dev/null; then
+    journalctl --vacuum-size=10M >/dev/null 2>&1 && info "Trimmed systemd journal to 10MB"
+fi
+
+# Rotated and compressed logs
+rm -f /var/log/*.gz /var/log/*.1 /var/log/*.old 2>/dev/null
+rm -f /var/log/**/*.gz /var/log/**/*.1 /var/log/**/*.old 2>/dev/null
+
+# Truncate (don't delete) large active log files
+for logf in /var/log/syslog /var/log/kern.log /var/log/auth.log /var/log/daemon.log \
+            /var/log/dpkg.log /var/log/alternatives.log /var/log/cloud-init.log \
+            /var/log/cloud-init-output.log /var/log/unattended-upgrades/*.log; do
+    if [ -f "$logf" ] && [ "$(stat -c%s "$logf" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+        truncate -s 0 "$logf" 2>/dev/null
+    fi
+done
+info "Cleaned log files"
+
+# ---------- Debian documentation & locales (200-400MB on fresh installs) ----------
+
+# Documentation (not needed on a server)
+if [ -d "/usr/share/doc" ]; then
+    SZ=$(du -sm /usr/share/doc 2>/dev/null | awk '{print $1}')
+    rm -rf /usr/share/doc/*
+    FREED=$((FREED + SZ))
+    info "Cleared /usr/share/doc (${SZ}MB)"
+fi
+
+# Man pages (not needed on a server)
+if [ -d "/usr/share/man" ]; then
+    SZ=$(du -sm /usr/share/man 2>/dev/null | awk '{print $1}')
+    rm -rf /usr/share/man/*
+    FREED=$((FREED + SZ))
+    info "Cleared /usr/share/man (${SZ}MB)"
+fi
+
+# Non-English locales
+if [ -d "/usr/share/locale" ]; then
+    SZ=$(du -sm /usr/share/locale 2>/dev/null | awk '{print $1}')
+    find /usr/share/locale -mindepth 1 -maxdepth 1 ! -name 'en*' ! -name 'locale.alias' -exec rm -rf {} + 2>/dev/null
+    NEWZ=$(du -sm /usr/share/locale 2>/dev/null | awk '{print $1}')
+    DIFF=$((SZ - NEWZ))
+    if [ "$DIFF" -gt 0 ]; then
+        FREED=$((FREED + DIFF))
+        info "Cleared non-English locales (${DIFF}MB)"
+    fi
+fi
+
+# Info pages
+rm -rf /usr/share/info/* 2>/dev/null
+# Lint files
+rm -rf /usr/share/lintian/* 2>/dev/null
+
+# ---------- Snap (if present) ----------
+
 if command -v snap &>/dev/null; then
     snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}' | while read snapname revision; do
         snap remove "$snapname" --revision="$revision" 2>/dev/null && info "Removed old snap revision: $snapname ($revision)"
     done
 fi
 
-if [ "$FREED" -gt 0 ]; then
-    info "Total freed: ~${FREED}MB"
-else
-    info "Nothing significant to clean up"
+# ---------- Misc caches ----------
+
+# Generic cache directory (includes pip, npm, etc.)
+for d in /root/.cache/pip /root/.npm /root/.cache/yarn /root/.cache/thumbnails; do
+    if [ -d "$d" ]; then
+        SZ=$(du -sm "$d" 2>/dev/null | awk '{print $1}')
+        rm -rf "$d"
+        FREED=$((FREED + SZ))
+        info "Cleared cache: $(basename $d) (${SZ}MB)"
+    fi
+done
+
+# Old /opt/evilginx from previous installs (binary will be re-copied)
+if [ -f "/opt/evilginx/evilginx" ]; then
+    rm -f /opt/evilginx/evilginx
+    info "Removed old installed binary"
 fi
 
-# Show current disk usage
-info "Disk usage: $(df -h / | awk 'NR==2{print $3 " used / " $2 " total (" $5 " full)"}')"
+# ---------- Summary ----------
+
+sync
+AFTER_KB=$(df / | awk 'NR==2{print $3}')
+ACTUAL_FREED_MB=$(( (BEFORE_KB - AFTER_KB) / 1024 ))
+info "Disk after cleanup: $(df -h / | awk 'NR==2{print $3 " used / " $2 " total (" $5 " full)"}')"
+if [ "$ACTUAL_FREED_MB" -gt 0 ] 2>/dev/null; then
+    info "Actually freed: ~${ACTUAL_FREED_MB}MB"
+fi
+
+# Check if we have enough space to build (need ~500MB free for Go build)
+AVAIL_MB=$(df -m / | awk 'NR==2{print $4}')
+if [ "$AVAIL_MB" -lt 300 ]; then
+    error "Only ${AVAIL_MB}MB free — need at least 300MB to build. Consider a larger droplet."
+    error "Showing largest directories:"
+    du -xh / 2>/dev/null | sort -rh | head -20
+    exit 1
+elif [ "$AVAIL_MB" -lt 500 ]; then
+    warn "Only ${AVAIL_MB}MB free — build may be tight. Continuing anyway..."
+fi
 
 # ─── Step 1: System packages ────────────────────────────────────────
 step "Installing system dependencies"
@@ -155,8 +277,16 @@ apt-get install -y -qq \
     ca-certificates \
     gnupg \
     unzip \
+    xvfb \
     > /dev/null 2>&1
 info "Base packages installed"
+
+# Verify Xvfb is available (critical for non-headless Chrome stealth)
+if command -v Xvfb &>/dev/null; then
+    info "Xvfb installed — Chrome will run in non-headless mode (ultimate stealth)"
+else
+    warn "Xvfb not found — Chrome will fall back to --headless=new mode"
+fi
 
 # ─── Step 2: Install Go (if not present or too old) ─────────────────
 step "Checking Go installation"
@@ -223,6 +353,15 @@ info "Compiling..."
 mkdir -p ./build
 go build -o ./build/evilginx -mod=vendor main.go
 info "Binary built: $(ls -lh ./build/evilginx | awk '{print $5}') → ./build/evilginx"
+
+# Post-build cleanup: clear Go build cache and temp files to reclaim space
+info "Post-build cleanup..."
+go clean -cache 2>/dev/null || rm -rf /root/.cache/go-build 2>/dev/null
+rm -rf /tmp/go-build* 2>/dev/null
+rm -f /tmp/cgo-gcc-input-* 2>/dev/null
+# Vendor directory no longer needed after build (binary is self-contained)
+rm -rf "$SCRIPT_DIR/vendor" 2>/dev/null
+info "Post-build cleanup done — $(df -h / | awk 'NR==2{print $4}') free"
 
 # ─── Step 5: Install to /opt/evilginx ───────────────────────────────
 step "Installing to $INSTALL_DIR"
@@ -331,6 +470,13 @@ for svc in apache2 nginx; do
         echo -e "    ${CYAN}sudo systemctl stop $svc && sudo systemctl disable $svc${NC}"
     fi
 done
+
+# ─── Final cleanup & disk report ─────────────────────────────────────
+step "Final cleanup"
+apt-get clean -qq 2>/dev/null || true
+rm -rf /var/lib/apt/lists/* 2>/dev/null
+rm -rf /root/.cache/go-build /tmp/go-build* /tmp/cgo-gcc-input-* 2>/dev/null
+info "Final disk: $(df -h / | awk 'NR==2{print $3 " used / " $2 " total (" $5 " full) — " $4 " free"}')"
 
 # ─── Done ────────────────────────────────────────────────────────────
 echo ""
