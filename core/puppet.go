@@ -945,7 +945,11 @@ func (pm *PuppetManager) GetDashboardURL() string {
 // detection. Equivalent to puppeteer-extra-plugin-stealth's Chrome launch args.
 func StealthChromeOpts(userAgent string, viewportW, viewportH int) []chromedp.ExecAllocatorOption {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
+		// Use Chrome's new headless mode (--headless=new) which runs a real browser
+		// engine without a display. The old mode (--headless) has many detectable
+		// artifacts. New headless is available in Chrome 112+ and is nearly
+		// indistinguishable from a normal Chrome window.
+		chromedp.Flag("headless", "new"),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
