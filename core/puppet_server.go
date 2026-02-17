@@ -879,6 +879,37 @@ body {
         }
     }
 
+    // ---- Keyboard/paste on main document (catches keys when focus is on overlay/body) ----
+    function handleKeyDown(e) {
+        if (document.activeElement === urlBar) return;
+        if ((e.ctrlKey || e.metaKey) && e.key === 'v') return;
+        if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return;
+        e.preventDefault();
+
+        var keyName = e.key;
+        if (e.ctrlKey && e.key === 'Backspace') keyName = 'CtrlBackspace';
+        else if (e.ctrlKey && e.key === 'z') keyName = 'CtrlZ';
+        else if (e.ctrlKey && e.key === 'y') keyName = 'CtrlY';
+
+        var msg = {type: 'keypress', key: keyName, code: e.code};
+        if (e.key.length > 1) {
+            var mod = 0;
+            if (e.altKey) mod |= 1;
+            if (e.ctrlKey) mod |= 2;
+            if (e.metaKey) mod |= 4;
+            if (e.shiftKey) mod |= 8;
+            if (mod) msg.modifiers = mod;
+        }
+        sendInput(msg);
+    }
+    document.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('paste', function(e) {
+        if (document.activeElement === urlBar) return;
+        var text = (e.clipboardData || window.clipboardData).getData('text');
+        if (text) sendInput({type: 'type', text: text});
+        e.preventDefault();
+    });
+
     // ---- Toolbar buttons ----
     document.getElementById('btn-back').addEventListener('click', function() {
         sendInput({type: 'back'});
