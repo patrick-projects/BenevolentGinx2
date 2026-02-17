@@ -606,24 +606,27 @@ func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) 
 	default:
 		return chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 			if len(keyName) == 1 {
-				// Printable character — dispatch full KeyDown → Char → KeyUp sequence.
-				// This matches Puppeteer's keyboard.press() behavior. Just sending KeyChar
-				// alone doesn't work because SPAs (Microsoft login, etc.) listen for
-				// keydown events to validate input and manage focus.
+				// Printable character — dispatch KeyDown → InsertText → KeyUp.
+				// KeyDown fires the keydown event (sites like Microsoft listen for it).
+				// InsertText (CDP Input.insertText) directly inserts text into the
+				// focused element, firing beforeinput + input events that React
+				// controlled inputs require. KeyChar alone only fires keypress which
+				// modern React apps don't rely on for text insertion.
+				// KeyUp fires the keyup event for completeness.
 				code, vk := charToCodeAndVK(keyName)
-				text := keyName
 
-				evtDown := input.DispatchKeyEvent(input.KeyDown).
+				if err := input.DispatchKeyEvent(input.KeyDown).
 					WithKey(keyName).
 					WithCode(code).
-					WithText(text).
+					WithText(keyName).
+					WithUnmodifiedText(keyName).
 					WithWindowsVirtualKeyCode(vk).
-					WithNativeVirtualKeyCode(vk)
-				if err := evtDown.Do(ctx); err != nil {
+					WithNativeVirtualKeyCode(vk).
+					Do(ctx); err != nil {
 					return err
 				}
 
-				if err := input.DispatchKeyEvent(input.KeyChar).WithText(text).Do(ctx); err != nil {
+				if err := input.InsertText(keyName).Do(ctx); err != nil {
 					return err
 				}
 
@@ -662,41 +665,12 @@ func (pm *PuppetManager) handleKeyPress(puppet *PuppetInstance, pi PuppetInput) 
 
 func (pm *PuppetManager) handleType(puppet *PuppetInstance, pi PuppetInput) error {
 	log.Info("puppet [%d]: type text='%s' (%d chars)", puppet.Id, pi.Text, len(pi.Text))
-	for _, ch := range pi.Text {
-		charStr := string(ch)
-		err := chromedp.Run(puppet.ctx,
-			chromedp.ActionFunc(func(ctx context.Context) error {
-				code, vk := charToCodeAndVK(charStr)
-
-				if err := input.DispatchKeyEvent(input.KeyDown).
-					WithKey(charStr).
-					WithCode(code).
-					WithText(charStr).
-					WithWindowsVirtualKeyCode(vk).
-					WithNativeVirtualKeyCode(vk).
-					Do(ctx); err != nil {
-					return err
-				}
-
-				if err := input.DispatchKeyEvent(input.KeyChar).
-					WithText(charStr).
-					Do(ctx); err != nil {
-					return err
-				}
-
-				return input.DispatchKeyEvent(input.KeyUp).
-					WithKey(charStr).
-					WithCode(code).
-					WithWindowsVirtualKeyCode(vk).
-					WithNativeVirtualKeyCode(vk).
-					Do(ctx)
-			}),
-		)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	// For pasted text, use InsertText directly for the entire string.
+	// This is equivalent to Puppeteer's page.keyboard.insertText() and is the
+	// most reliable way to insert text into React controlled inputs.
+	return chromedp.Run(puppet.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		return input.InsertText(pi.Text).Do(ctx)
+	}))
 }
 
 func (pm *PuppetManager) handleKeyDown(puppet *PuppetInstance, pi PuppetInput) error {
